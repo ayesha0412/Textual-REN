@@ -1,0 +1,60 @@
+data:
+  sam2_ckpt: '../checkpoints/sam2.1_hiera_large.pt'
+
+text_query:
+  similarity_threshold: 0.20   # CLIP cosine similarity cutoff for candidate frames
+  context_seconds: 5.0          # clip length around last occurrence (±N seconds)
+  frame_sample_rate: 2          # process every Nth frame for CLIP retrieval (1 = all)
+  tracker_name: 'sam2'
+  tracker_param: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+  patch_size: 8                 # feature patch size for SAM-pooled tokens (DINO)
+  save_dir: 'logs/'
+
+  # FAISS indexing parameters
+  faiss:
+    # CLIP embedding dimension (OpenCLIP ViT-g-14)
+    clip_dim: 1024    # ViT-g-14 output dim
+    # Number of FAISS candidates to refine during query (higher = slower but more accurate)
+    top_k: 100
+    # Index type: 'flat' (exact) or 'ivf' (approximate, faster)
+    index_type: 'flat'
+
+  # Text-Region Adapter (bridges CLIP → REN space)
+  adapter:
+    input_dim: 1024    # CLIP text embedding dimension (ViT-g-14 = 1024, ViT-G-14 = 1280)
+    output_dim: 1024   # REN region token dimension
+    temperature: 0.1   # Softmax temperature for scoring
+
+ren:
+  pretrained:
+    feature_extractors:
+      - 'dinov2_vitl14'
+    patch_sizes:
+      - 14
+    region_extractor: 'sam2_hierra'
+    sam2_hieral_ckpt: '../checkpoints/sam2.1_hiera_large.pt'
+    sam2_hieral_config: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+
+  architecture:
+    grid_size: 32
+    hidden_dim: 1024
+    decoder_layers: 4
+    num_attention_heads: 8
+
+  parameters:
+    image_resolution: 518
+    batch_size: 16
+    learning_rate: 0.001
+    num_epochs: 50
+    max_prompts: 256
+    accumulation_steps: 1
+    warmup_steps: 100
+    logging_steps: 25
+    max_grad_norm: 5.0
+    upsample_features: False
+    deduplicate_masks: False
+    num_workers: 16
+
+  logging:
+    save_dir: '../logs/'
+    exp_name: 'ren-dinov2-vitl14'
