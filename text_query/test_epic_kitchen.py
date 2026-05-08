@@ -22,6 +22,7 @@ import time
 
 import cv2
 import numpy as np
+import yaml
 
 # Add parent dirs to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -56,20 +57,20 @@ class ValidationSuite:
         ("inside kitchen", 0.28, "location"),
     ]
 
-    def __init__(self, index_dir: str, video_path: str, output_dir: str):
+    def __init__(self, index_dir: str, video_path: str, output_dir: str, config: Dict):
         self.index_dir = index_dir
         self.video_path = video_path
         self.output_dir = output_dir
+        self.config = config
         os.makedirs(output_dir, exist_ok=True)
 
         # Load engine once (faster than reloading for each query)
-        self.engine = IndexedQueryEngine({}, index_dir)
+        self.engine = IndexedQueryEngine(config, index_dir)
 
     def run_query(
         self,
         query: str,
         threshold: float = None,
-        top_k: int = 100
     ) -> Tuple[Dict, float]:
         """
         Run single query and return result + latency.
@@ -85,7 +86,6 @@ class ValidationSuite:
                 self.video_path,
                 os.path.join(self.output_dir, query.replace(" ", "_")),
                 threshold=threshold,
-                top_k=top_k
             )
             latency = time.time() - start_time
             return result, latency, None
@@ -116,13 +116,13 @@ class ValidationSuite:
         total_time = 0
         success_count = 0
 
-        print(f"\n{'='*70}")
-        print(f"{"VALIDATION SUITE": ^70}")
-        print(f"{'='*70}")
+        print("\n" + "=" * 70)
+        print("VALIDATION SUITE".center(70))
+        print("=" * 70)
         print(f"Video: {os.path.basename(self.video_path)}")
         print(f"Index: {os.path.basename(self.index_dir)}")
         print(f"Queries: {len(queries)}")
-        print(f"{'='*70}\n")
+        print("=" * 70 + "\n")
 
         for i, (query, threshold, description) in enumerate(queries, 1):
             print(f"[{i}/{len(queries)}] Query: '{query}'")
@@ -142,10 +142,15 @@ class ValidationSuite:
                 query_result.update({
                     'last_frame_idx': result['last_frame_idx'],
                     'last_frame_timestamp': result['last_frame_timestamp'],
-                    'best_region_score': result['best_region_score'],
+                    'region_clip_score': result['region_clip_score'],
+                    'fused_similarity': result['fused_similarity'],
                     'context_seconds': result['context_seconds'],
                 })
-                print(f"      ✓ Success | Frame: {result['best_frame_idx']} | Score: {result['best_region_score']:.3f} | Time: {latency:.1f}s")
+                print(
+                    "      ✓ Success | Frame: "
+                    f"{result['last_frame_idx']} | Crop: {result['region_clip_score']:.3f} | "
+                    f"Sim: {result['fused_similarity']:.3f} | Time: {latency:.1f}s"
+                )
                 success_count += 1
                 total_time += latency
             else:
@@ -217,6 +222,7 @@ def main():
     )
     parser.add_argument('--index', type=str, required=True, help='Path to FAISS index directory')
     parser.add_argument('--video', type=str, required=True, help='Path to video file')
+    parser.add_argument('--config', type=str, default='config.yaml', help='Path to config.yaml')
     parser.add_argument('--output', type=str, default='validation_results/',
                        help='Output directory for results')
     parser.add_argument('--batch', action='store_true',
@@ -234,8 +240,15 @@ def main():
         print(f"Error: Video file not found: {args.video}")
         sys.exit(1)
 
+    # Load config
+    config_path = args.config
+    if not os.path.isabs(config_path):
+        config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), config_path)
+    with open(config_path, 'r') as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+
     # Run validation
-    suite = ValidationSuite(args.index, args.video, args.output)
+    suite = ValidationSuite(args.index, args.video, args.output, config)
 
     if args.custom_query:
         # Custom queries

@@ -11,17 +11,17 @@ import torch.nn as nn
 
 class TextRegionAdapter(nn.Module):
     """
-    Maps CLIP text embeddings (1280-dim) to REN region token space (1024-dim).
+    Maps CLIP text embeddings (1024-dim, ViT-g-14) to REN region token space (1024-dim).
 
     Used to score REN region crops against text queries by projecting the text
     embedding into the same space as region tokens, enabling direct cosine similarity.
 
     Args:
-        input_dim: CLIP text embedding dimension (default: 1280)
+        input_dim: CLIP text embedding dimension (default: 1024 for ViT-g-14)
         output_dim: REN region token dimension (default: 1024)
     """
 
-    def __init__(self, input_dim: int = 1280, output_dim: int = 1024):
+    def __init__(self, input_dim: int = 1024, output_dim: int = 1024):
         super().__init__()
         self.projection = nn.Linear(input_dim, output_dim, bias=False)
         # Initialize with small random weights for stable training
@@ -71,7 +71,7 @@ class ClipRegionScorer(nn.Module):
         Score region tokens against text query.
 
         Args:
-            text_embedding: Shape (1280,) or (batch_size, 1280)
+            text_embedding: Shape (1024,) or (batch_size, 1024)
             region_tokens: Shape (num_regions, 1024) or (batch_size, num_regions, 1024)
 
         Returns:

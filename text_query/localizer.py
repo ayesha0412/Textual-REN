@@ -48,6 +48,7 @@ class TextQueryLocalizer:
 
     def __init__(self, config: dict):
         self.config = config
+        self.device = torch.device(device)
         self.sam2_ckpt    = config['data']['sam2_ckpt']
         self.tracker_param = config['text_query']['tracker_param']
         self.patch_size   = config['text_query']['patch_size']
@@ -59,8 +60,16 @@ class TextQueryLocalizer:
         self.clip_model.eval()
         self.tokenizer = open_clip.get_tokenizer('ViT-g-14')
 
-        print('[TextQueryLocalizer] Loading REN (DINOv2 ViT-L/14)…')
-        self.ren = REN(config['ren'])
+        # REN loaded lazily on first use — indexing never needs it,
+        # so this keeps ~3–4 GB VRAM free during prepare_index.py.
+        self._ren = None
+
+    @property
+    def ren(self):
+        if self._ren is None:
+            print('[TextQueryLocalizer] Loading REN (DINOv2 ViT-L/14)…')
+            self._ren = REN(self.config['ren'])
+        return self._ren
 
     # ------------------------------------------------------------------ #
     # Encoding                                                             #
@@ -68,8 +77,10 @@ class TextQueryLocalizer:
 
     def encode_text(self, query: str) -> torch.Tensor:
         """Returns L2-normalised CLIP text embedding, shape (1, D)."""
-        tokens = self.tokenizer([query]).to(device)
-        with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+        tokens = self.tokenizer([query]).to(self.device)
+        with torch.no_grad(), torch.autocast(
+            self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
+        ):
             feat = self.clip_model.encode_text(tokens).float()
         return F.normalize(feat, p=2, dim=-1)
 
@@ -79,8 +90,10 @@ class TextQueryLocalizer:
         for i in tqdm(range(0, len(frames), batch_size), desc='  CLIP frames', leave=False):
             imgs = torch.stack([
                 self.clip_preprocess(Image.fromarray(f)) for f in frames[i:i + batch_size]
-            ]).to(device)
-            with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+            ]).to(self.device)
+            with torch.no_grad(), torch.autocast(
+                self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
+            ):
                 feats = self.clip_model.encode_image(imgs).float()
             all_feats.append(F.normalize(feats, p=2, dim=-1).cpu())
         return torch.cat(all_feats)  # (N, D)
@@ -103,37 +116,85 @@ class TextQueryLocalizer:
         idx = above[-1].item() if len(above) > 0 else sims.argmax().item()
         return idx, sims[idx].item(), sims
 
+    def find_last_occurrence_temporal(
+        self,
+        sims: torch.Tensor,
+        frame_metadata: list,
+        fps: float,
+        sample_rate: int,
+        threshold: float,
+    ) -> tuple:
+        """
+        Temporal segmentation over similarity scores.
+        Returns (sampled_idx, score, sims).
+        """
+        above = np.where(sims.numpy() >= threshold)[0]
+        if len(above) == 0:
+            idx = int(sims.argmax())
+            return idx, float(sims[idx]), sims
+
+        sorted_above = sorted(above.tolist(),
+                              key=lambda i: frame_metadata[i]['frame_idx'])
+        gap_frames = max(1, int(2.0 * fps / sample_rate)) * sample_rate
+
+        segments = []
+        current = [sorted_above[0]]
+        for idx in sorted_above[1:]:
+            prev_vidx = frame_metadata[current[-1]]['frame_idx']
+            curr_vidx = frame_metadata[idx]['frame_idx']
+            if curr_vidx - prev_vidx > gap_frames:
+                segments.append(current)
+                current = [idx]
+            else:
+                current.append(idx)
+        segments.append(current)
+
+        valid = [s for s in segments if len(s) >= 2] or segments
+        last_segment = valid[-1]
+        best_idx = max(last_segment, key=lambda i: sims[i])
+        return int(best_idx), float(sims[best_idx]), sims
+
     # ------------------------------------------------------------------ #
     # Region localization (REN + CLIP bridge)                             #
     # ------------------------------------------------------------------ #
 
     def find_best_region(self, frame: np.ndarray,
-                          region_tokens: dict,
-                          frame_key: str,
+                          region_tokens: torch.Tensor,
+                          local_frame_idx: int,
                           text_feat: torch.Tensor) -> tuple:
         """
-        Among REN region tokens for frame_key, score each region crop with CLIP.
+        Among REN region tokens for local_frame_idx, score each region crop with CLIP.
         Returns (best_point [y,x], best_clip_score).
         """
-        tokens = region_tokens.get(frame_key, [])
         h, w = frame.shape[:2]
 
-        if not tokens:
+        if region_tokens is None or region_tokens.numel() == 0:
             return np.array([h / 2.0, w / 2.0], dtype=np.float32), 0.0
+
+        tokens = region_tokens[local_frame_idx]
+        grid_points = self.ren.grid_points.cpu().numpy()
+        img_res = self.config['ren']['parameters']['image_resolution']
+        scale_y = h / float(img_res)
+        scale_x = w / float(img_res)
+        max_regions = min(tokens.shape[0], grid_points.shape[0])
 
         patch_r = max(32, min(h, w) // 8)
         best_score, best_point = -1.0, None
 
-        for info in tokens:
-            py, px = int(info['point'][0]), int(info['point'][1])
+        for i in range(max_regions):
+            py, px = grid_points[i]
+            py = int(py * scale_y)
+            px = int(px * scale_x)
             y1, y2 = max(0, py - patch_r), min(h, py + patch_r)
             x1, x2 = max(0, px - patch_r), min(w, px + patch_r)
             patch = frame[y1:y2, x1:x2]
             if patch.size == 0:
                 continue
 
-            img = self.clip_preprocess(Image.fromarray(patch)).unsqueeze(0).to(device)
-            with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+            img = self.clip_preprocess(Image.fromarray(patch)).unsqueeze(0).to(self.device)
+            with torch.no_grad(), torch.autocast(
+                self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
+            ):
                 pfeat = F.normalize(self.clip_model.encode_image(img).float(), p=2, dim=-1)
 
             score = (pfeat @ text_feat.T).item()
@@ -152,11 +213,15 @@ class TextQueryLocalizer:
 
     def point_to_bbox(self, frame: np.ndarray,
                        point: np.ndarray,
-                       text_feat: torch.Tensor) -> torch.Tensor:
+                       text_feat: torch.Tensor,
+                       max_area_frac: float = 0.12) -> torch.Tensor:
         """
         Runs SAM2 multi-mask prediction at the given point.
         Picks the mask whose crop is most similar to the text query via CLIP.
         Returns bbox as [x, y, w, h] tensor.
+
+        max_area_frac: upper bound on mask area as fraction of frame.
+        Pass a larger value (e.g. 0.60) for large-area objects like paintings.
         """
         masks_list = get_sam_region_from_points(
             self.sam2_ckpt, self.tracker_param, [frame], [point]
@@ -171,24 +236,38 @@ class TextQueryLocalizer:
         if not masks_list or not masks_list[0]:
             return fallback
 
-        best_score, best_bbox = -1.0, None
+        h, w = frame.shape[:2]
+        frame_area = h * w
+        MIN_AREA_FRAC = 0.001   # reject masks < 0.1% of frame (noise)
+        MAX_AREA_FRAC = max_area_frac
+
+        candidates = []
         for mask in masks_list[0]:
             rows, cols = np.where(mask == 1)
             if len(rows) == 0:
                 continue
+            area_frac = len(rows) / frame_area
             y1, y2, x1, x2 = rows.min(), rows.max(), cols.min(), cols.max()
             patch = frame[y1:y2, x1:x2]
             if patch.size == 0:
                 continue
-            img = self.clip_preprocess(Image.fromarray(patch)).unsqueeze(0).to(device)
-            with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+            img = self.clip_preprocess(Image.fromarray(patch)).unsqueeze(0).to(self.device)
+            with torch.no_grad(), torch.autocast(
+                self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
+            ):
                 mfeat = F.normalize(self.clip_model.encode_image(img).float(), p=2, dim=-1)
             score = (mfeat @ text_feat.T).item()
-            if score > best_score:
-                best_score = score
-                best_bbox = torch.tensor([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
+            bbox = torch.tensor([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
+            candidates.append((score, area_frac, bbox))
 
-        return best_bbox if best_bbox is not None else fallback
+        if not candidates:
+            return fallback
+
+        # Prefer masks within the acceptable size range; fall back to all candidates
+        sized = [(s, a, b) for s, a, b in candidates if MIN_AREA_FRAC <= a <= MAX_AREA_FRAC]
+        pool = sized if sized else candidates
+        best_score, _, best_bbox = max(pool, key=lambda t: t[0])
+        return best_bbox
 
     # ------------------------------------------------------------------ #
     # SAM2 tracking                                                        #
@@ -215,15 +294,17 @@ class TextQueryLocalizer:
         end   = min(len(frames), frame_idx + half_span + 1)
         window = frames[start:end]
 
-        transformed = torch.cat([transform(np.array(f)) for f in window]).to(device)
+        transformed = torch.cat([transform(np.array(f)) for f in window]).to(self.device)
         h, w = np.array(window[0]).shape[:2]
         local_idx = frame_idx - start
 
         x, y, bw, bh = [float(v) for v in bbox]
-        tracker = build_sam2_video_predictor(self.tracker_param, self.sam2_ckpt, device=device)
+        tracker = build_sam2_video_predictor(self.tracker_param, self.sam2_ckpt, device=self.device)
         track = []
 
-        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
+        with torch.inference_mode(), torch.autocast(
+            self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
+        ):
             state = tracker.init_state(images=transformed, video_height=h, video_width=w)
             tracker.reset_state(state)
             tracker.add_new_points_or_box(
@@ -327,7 +408,11 @@ class TextQueryLocalizer:
             frame_idx += 1
 
         frame_feats = self.encode_frames_clip(sampled_frames)
-        sampled_idx, clip_score, sims = self.find_last_occurrence(text_feat, frame_feats, thr)
+        frame_metadata = [{'frame_idx': idx} for idx in sampled_indices]
+        sims = (frame_feats @ text_feat.cpu().T).squeeze(-1)
+        sampled_idx, clip_score, sims = self.find_last_occurrence_temporal(
+            sims, frame_metadata, fps, srate, thr
+        )
         last_idx = sampled_indices[sampled_idx]
         print(f'      Last occurrence → frame {last_idx}  '
               f'(t={last_idx / fps:.2f}s,  CLIP score={clip_score:.4f})')
@@ -337,13 +422,20 @@ class TextQueryLocalizer:
         print('[4/6] REN region encoding on candidate window…')
         win_size   = 5  # frames before last_idx fed to REN
         win_start  = max(0, sampled_idx - win_size)
-        cand_frames = np.array(sampled_frames[win_start:sampled_idx + 1])
-        region_tokens = self.ren(cand_frames)
+        img_res = self.config['ren']['parameters']['image_resolution']
+        ren_transform = T.Compose([
+            T.ToTensor(),
+            T.Resize((img_res, img_res), antialias=True),
+        ])
+        frame_tensors = torch.stack([
+            ren_transform(Image.fromarray(f))
+            for f in sampled_frames[win_start:sampled_idx + 1]
+        ]).to(self.device)
+        region_tokens = self.ren(frame_tensors)
 
         # Map local key → absolute sampled index
-        local_key = f'frame-{sampled_idx - win_start}'
         best_point, region_score = self.find_best_region(
-            sampled_frames[sampled_idx], region_tokens, local_key, text_feat
+            sampled_frames[sampled_idx], region_tokens, sampled_idx - win_start, text_feat
         )
         print(f'      Best region point: (y={best_point[0]:.1f}, x={best_point[1]:.1f})  '
               f'score={region_score:.4f}')

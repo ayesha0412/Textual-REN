@@ -16,11 +16,16 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 import pickle
 
+# Must be set before any cv2.VideoCapture is opened — EPIC Kitchen / Ego4D videos
+# have interleaved audio+video streams that exhaust OpenCV's default packet limit.
+os.environ.setdefault('OPENCV_FFMPEG_READ_ATTEMPTS', '65536')
+
 import cv2
 import numpy as np
 import torch
 import yaml
 from PIL import Image
+import torchvision.transforms as T
 
 # Add parent dirs to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -40,6 +45,14 @@ except ImportError:
     print("")
     print("Note: faiss-gpu/faiss-cpu are not available via pip.")
     sys.exit(1)
+
+try:
+    import easyocr
+    HAS_OCR = True
+except ImportError:
+    HAS_OCR = False
+    print("Warning: easyocr not installed — brand/text recognition disabled.")
+    print("  pip install easyocr")
 
 from localizer import TextQueryLocalizer
 
@@ -68,7 +81,10 @@ class VideoIndexer:
         
         # Device for GPU/CPU
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        
+
+        # OCR reader: initialized lazily on first frame that needs it
+        self.ocr_reader = None
+
         # GPU support
         self.use_gpu = HAS_GPU
         if self.use_gpu:
@@ -80,6 +96,7 @@ class VideoIndexer:
         output_dir: str,
         sample_rate: int = None,
         skip_ren: bool = True,
+        skip_ocr: bool = False,
     ) -> Dict:
         """
         Index a video: extract CLIP image embeddings and build FAISS index.
@@ -103,11 +120,6 @@ class VideoIndexer:
         os.makedirs(output_dir, exist_ok=True)
         print(f"Indexing video: {video_path}")
 
-        # Must be set BEFORE VideoCapture to raise OpenCV's packet-read budget.
-        # EPIC Kitchen / Ego4D videos have interleaved audio+video streams that
-        # exhaust the default limit of 4096 during sequential reads.
-        os.environ['OPENCV_FFMPEG_READ_ATTEMPTS'] = '65536'
-
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
             raise RuntimeError(f"Failed to open video: {video_path}")
@@ -128,6 +140,18 @@ class VideoIndexer:
 
         if skip_ren:
             print("  REN token extraction skipped (not needed for text-query mode)")
+        if skip_ocr or not HAS_OCR:
+            print("  OCR text extraction skipped (brand recognition disabled)")
+        else:
+            print("  OCR text extraction enabled (brand/label recognition)")
+            if self.ocr_reader is None:
+                print("  Initializing EasyOCR model on GPU...")
+                self.ocr_reader = easyocr.Reader(
+                    ['en'],
+                    gpu=self.device.type == 'cuda',
+                    verbose=False,
+                )
+                print("  EasyOCR ready.")
 
         # Direct-seek: jump to each target frame index rather than reading all
         # frames sequentially.  Avoids exhausting the multi-stream packet budget.
@@ -144,6 +168,12 @@ class VideoIndexer:
 
             clip_feat = self._extract_clip_embedding(frame)
             clip_embeddings.append(clip_feat)
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+
+            ocr_texts = self._extract_ocr(frame) if (not skip_ocr and HAS_OCR) else []
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
 
             if not skip_ren:
                 region_tokens = self._extract_region_tokens(frame)
@@ -154,6 +184,7 @@ class VideoIndexer:
                     'timestamp':        frame_idx / fps,
                     'region_count':     region_count,
                     'region_start_idx': len(all_region_tokens),
+                    'ocr_texts':        ocr_texts,
                 })
                 if region_count > 0:
                     all_region_tokens.append(region_tokens.cpu().numpy())
@@ -162,6 +193,7 @@ class VideoIndexer:
                     'frame_idx':        frame_idx,
                     'sampled_frame_idx': sampled_frame_idx,
                     'timestamp':        frame_idx / fps,
+                    'ocr_texts':        ocr_texts,
                 })
 
         cap.release()
@@ -182,13 +214,13 @@ class VideoIndexer:
         if self.use_gpu:
             # Create GPU index for fast search
             print("  Using GPU-accelerated index")
-            cpu_index = faiss.IndexFlatL2(self.clip_dim)
+            cpu_index = faiss.IndexFlatIP(self.clip_dim)
             cpu_index.add(clip_embeddings.astype(np.float32))
             index = faiss.index_cpu_to_gpu(self.gpu_resources, 0, cpu_index)
         else:
             # Fallback to CPU index
             print("  Using CPU-based index")
-            index = faiss.IndexFlatL2(self.clip_dim)
+            index = faiss.IndexFlatIP(self.clip_dim)
             index.add(clip_embeddings.astype(np.float32))
         print(f"  Index built with {index.ntotal} frames")
 
@@ -238,6 +270,21 @@ class VideoIndexer:
             'fps': fps,
         }
 
+    def _extract_ocr(self, frame: np.ndarray) -> list:
+        """Extract visible text from a BGR frame. Reader must be initialized before calling."""
+        if self.ocr_reader is None:
+            return []
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        try:
+            detections = self.ocr_reader.readtext(rgb, detail=1, paragraph=False)
+            return [
+                {'text': text.lower().strip(), 'conf': round(float(conf), 3)}
+                for (_, text, conf) in detections
+                if conf >= 0.3 and len(text.strip()) > 1
+            ]
+        except Exception:
+            return []
+
     def _extract_clip_embedding(self, frame: np.ndarray) -> np.ndarray:
         """
         Extract CLIP image embedding from a frame.
@@ -255,7 +302,9 @@ class VideoIndexer:
         # Extract CLIP embedding using localizer's preprocess
         img_tensor = self.localizer.clip_preprocess(pil_image).unsqueeze(0).to(self.device)
         
-        with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16):
+        with torch.no_grad(), torch.autocast(
+            self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
+        ):
             clip_embedding = self.localizer.clip_model.encode_image(img_tensor).float()
         
         # Normalize and return
@@ -276,18 +325,23 @@ class VideoIndexer:
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(rgb_frame)
 
-        # Apply REN's transform
-        transformed_image = self.localizer.ren.transform(pil_image)
+        img_res = self.config['ren']['parameters']['image_resolution']
+        transform = T.Compose([
+            T.ToTensor(),
+            T.Resize((img_res, img_res), antialias=True),
+        ])
+        transformed_image = transform(pil_image)
 
         # Extract features using REN's feature extractor
         image_batch = transformed_image.unsqueeze(0).to(self.device)
         
         with torch.no_grad():
             # Get feature maps from extractor
+            upsample_features = self.config['ren']['parameters'].get('upsample_features', False)
             _, feature_maps = self.localizer.ren.feature_extractor(
                 self.localizer.ren.extractor_name,
                 image_batch,
-                resize=self.localizer.ren.upsample_features
+                resize=upsample_features
             )
 
             # Get region tokens from region encoder
@@ -315,6 +369,8 @@ def main():
     parser.add_argument('--output', type=str, help='Output directory for index (required)')
     parser.add_argument('--sample-rate', type=int, default=None, dest='sample_rate',
                         help='Process every Nth frame (default: from config)')
+    parser.add_argument('--skip-ocr', action='store_true', dest='skip_ocr',
+                        help='Skip OCR extraction (faster, no brand recognition)')
 
     args = parser.parse_args()
 
@@ -353,7 +409,8 @@ def main():
 
     # Build index
     indexer = VideoIndexer(config)
-    metadata = indexer.index_video(args.video, args.output, sample_rate=args.sample_rate)
+    metadata = indexer.index_video(args.video, args.output, sample_rate=args.sample_rate,
+                                   skip_ocr=args.skip_ocr)
 
     print("\n=== Indexing Complete ===")
     for k, v in metadata.items():
