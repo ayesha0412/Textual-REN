@@ -2,9 +2,16 @@ data:
   sam2_ckpt: '../checkpoints/sam2.1_hiera_large.pt'
 
 text_query:
-  similarity_threshold: 0.20   # CLIP cosine similarity cutoff for candidate frames
+  similarity_threshold: 0.18   # CLIP cosine similarity cutoff for candidate frames
+  use_compositional: false      # disable query decomposition (future work)
   context_seconds: 5.0          # clip length around last occurrence (±N seconds)
-  frame_sample_rate: 2          # process every Nth frame for CLIP retrieval (1 = all)
+  frame_sample_rate: 10         # process every Nth frame for CLIP retrieval (1 = all)
+  ocr_weight: 0.3               # weight for OCR brand match in fused score (0 = disabled)
+  min_crop_verify: 0.17         # min CLIP crop score to accept a candidate frame as valid
+  neg_weight: 0.25              # weight for negative prompts (0 = disabled)
+  # If the final segment is weak, fall back to the strongest segment instead.
+  last_segment_min_peak: 0.18   # absolute min peak to trust the last segment (= threshold)
+  last_segment_min_rel: 0.60    # or relative to global peak (last >= rel * global)
   tracker_name: 'sam2'
   tracker_param: 'configs/sam2.1/sam2.1_hiera_l.yaml'
   patch_size: 8                 # feature patch size for SAM-pooled tokens (DINO)
