@@ -214,7 +214,8 @@ class TextQueryLocalizer:
     def point_to_bbox(self, frame: np.ndarray,
                        point: np.ndarray,
                        text_feat: torch.Tensor,
-                       max_area_frac: float = 0.12) -> torch.Tensor:
+                       max_area_frac: float = 0.12,
+                       inference_size: int = 1024) -> torch.Tensor:
         """
         Runs SAM2 multi-mask prediction at the given point.
         Picks the mask whose crop is most similar to the text query via CLIP.
@@ -224,7 +225,8 @@ class TextQueryLocalizer:
         Pass a larger value (e.g. 0.60) for large-area objects like paintings.
         """
         masks_list = get_sam_region_from_points(
-            self.sam2_ckpt, self.tracker_param, [frame], [point]
+            self.sam2_ckpt, self.tracker_param, [frame], [point],
+            inference_size=inference_size,
         )
         h, w = frame.shape[:2]
         fallback = torch.tensor([

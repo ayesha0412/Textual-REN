@@ -424,6 +424,19 @@ class CandidateRefiner(nn.Module):
         # Define SAM2 parameters for segmentation mask generation
         self.tracker_param = config['visual_query']['tracker_param']
         self.sam2_ckpt = config['data']['sam2_ckpt']
+        
+        # Optimization flags
+        self.skip_sam2_eval = config.get('text_query', {}).get('skip_sam2_eval', False)
+        self.use_fast_tokens = config.get('text_query', {}).get('use_fast_tokens', False)
+        self.cache_sam_results = config.get('text_query', {}).get('cache_sam_results', False)
+        self._sam_cache = {}  # Cache for SAM2 results
+        
+        if self.skip_sam2_eval:
+            print("[CandidateRefiner] SAM2 will be SKIPPED during evaluation (using fallback masks)")
+        if self.use_fast_tokens:
+            print("[CandidateRefiner] Using FAST token generation mode")
+        if self.cache_sam_results:
+            print("[CandidateRefiner] SAM2 results caching ENABLED")
 
     def topp_selection(self, object_scores, object_idxs, top_p):
         topp_threshold = top_p
@@ -465,16 +478,29 @@ class CandidateRefiner(nn.Module):
                 updated_query_bboxes.append(updated_bbox)
             query_frames = np.concatenate(query_frames)
             cropped_query_frames = np.concatenate(cropped_query_frames)
-            sam_pooled_query_tokens = get_sam_pooled_tokens(query_frames, query_bboxes, self.sam2_ckpt, self.tracker_param,
-                                                            self.patch_size, self.config)
-            sam_pooled_cropped_query_tokens = get_sam_pooled_tokens(cropped_query_frames, updated_query_bboxes, self.sam2_ckpt,
-                                                                    self.tracker_param, self.patch_size, self.config)
+            
+            # Optimize: skip SAM2 during evaluation if configured
+            if self.skip_sam2_eval:
+                sam_pooled_query_tokens = self._get_fast_tokens(query_frames, query_bboxes)
+                sam_pooled_cropped_query_tokens = self._get_fast_tokens(cropped_query_frames, updated_query_bboxes)
+            elif self.use_fast_tokens:
+                sam_pooled_query_tokens = self._get_fast_tokens(query_frames, query_bboxes)
+                sam_pooled_cropped_query_tokens = self._get_fast_tokens(cropped_query_frames, updated_query_bboxes)
+            else:
+                sam_pooled_query_tokens = get_sam_pooled_tokens(query_frames, query_bboxes, self.sam2_ckpt, self.tracker_param,
+                                                                self.patch_size, self.config)
+                sam_pooled_cropped_query_tokens = get_sam_pooled_tokens(cropped_query_frames, updated_query_bboxes, self.sam2_ckpt,
+                                                                        self.tracker_param, self.patch_size, self.config)
 
             # Get object bboxes
             selected_object_bboxes = []
             for frame_id, object_point in zip(selected_frame_ids, selected_object_points):
-                object_bbox = point_to_bbox(frames[frame_id].numpy(), object_point, sam_pooled_query_tokens, None, None,
-                                            self.sam2_ckpt, self.tracker_param, self.patch_size, self.config)
+                if self.skip_sam2_eval:
+                    # Use fast point-to-bbox without SAM2
+                    object_bbox = self._fast_point_to_bbox(frames[frame_id].numpy(), object_point)
+                else:
+                    object_bbox = point_to_bbox(frames[frame_id].numpy(), object_point, sam_pooled_query_tokens, None, None,
+                                                self.sam2_ckpt, self.tracker_param, self.patch_size, self.config)
                 selected_object_bboxes.append(object_bbox)
 
             # Get cropped frames, updated bboxes, and cropping info for the selected video frames
@@ -527,8 +553,13 @@ class CandidateRefiner(nn.Module):
                 max_score_idx = crop_candidate_scores.argmax()
                 max_score_point = crop_candidate_points[max_score_idx]
                 max_score_cropped_frame = relevant_cropped_frames[max_score_idx]
-                max_score_bbox = point_to_bbox(max_score_cropped_frame, max_score_point, sam_pooled_cropped_query_tokens,
-                                               None, None, self.sam2_ckpt, self.tracker_param, self.patch_size, self.config)
+                
+                if self.skip_sam2_eval:
+                    # Use fast bbox without SAM2
+                    max_score_bbox = self._fast_point_to_bbox(max_score_cropped_frame, max_score_point)
+                else:
+                    max_score_bbox = point_to_bbox(max_score_cropped_frame, max_score_point, sam_pooled_cropped_query_tokens,
+                                                   None, None, self.sam2_ckpt, self.tracker_param, self.patch_size, self.config)
                 refined_scores.append(crop_candidate_scores.max().item())
 
                 # Undo the cropping transformation for the max score bbox
@@ -573,6 +604,43 @@ class CandidateRefiner(nn.Module):
                 candidate['query_match_idxs'] = candidate['query_match_idxs'][0][topp_object_idxs][None]
 
         return refined_candidates
+    
+    def _get_fast_tokens(self, frames, bboxes):
+        """Generate tokens quickly without SAM2 - use center region of bbox."""
+        from vq_utils import extract_image_features, upsample_feature
+        import math
+        
+        tokens = []
+        frames_features = extract_image_features(frames, self.config)
+        new_h, new_w = frames.shape[1], frames.shape[2]
+        padded_h = math.ceil(new_h / self.patch_size) * self.patch_size
+        padded_w = math.ceil(new_w / self.patch_size) * self.patch_size
+        frames_features = upsample_feature(frames_features.cpu(), new_h, new_w, padded_h, padded_w)
+        
+        for bbox, frame_features in zip(bboxes, frames_features):
+            # Use center region of bbox without SAM2
+            x, y, w, h = bbox
+            x_center = int(x + w / 2)
+            y_center = int(y + h / 2)
+            window = max(int(w / 4), int(h / 4), 10)  # use bbox size to determine window
+            
+            x_min = max(0, x_center - window)
+            x_max = min(frame_features.shape[2], x_center + window)
+            y_min = max(0, y_center - window)
+            y_max = min(frame_features.shape[1], y_center + window)
+            
+            features = frame_features[:, y_min:y_max, x_min:x_max]
+            feature_dims = features.shape[0]
+            token = features.reshape(feature_dims, -1).mean(1)[None]
+            tokens.append(token)
+        
+        return torch.cat(tokens)
+    
+    def _fast_point_to_bbox(self, frame, object_point, window_size=64):
+        """Fast point to bbox conversion without SAM2."""
+        from vq_utils import mask_to_bbox, _create_mask_from_point
+        mask = _create_mask_from_point(frame, object_point, window_size=window_size)
+        return mask_to_bbox(mask)
 
 
 class VisualQueryTracker(nn.Module):

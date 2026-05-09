@@ -38,7 +38,7 @@ This repo also includes **Textual-REN** — a complete text-to-video object loca
 
 ### Overview
 
-**Textual-REN** extends the REN visual query pipeline to accept free-text queries instead of visual exemplars. Given a natural language description (e.g., `"kitchen knife"`, `"fairy dish soap"`, `"red switch"`), the system searches an offline-indexed egocentric video, finds the **last genuine occurrence** of the described object, and returns:
+**Textual-REN** extends the REN and RELOCATE research to text-guided video object localization. Given a natural language description (e.g., `"kitchen knife"`, `"fairy dish soap"`, `"red switch"`), the system searches an offline-indexed egocentric video, finds the **last genuine occurrence** of the described object, and returns:
 
 - A trimmed video clip with a **green bounding box** around the object
 - The **timestamp** and **frame index** of the last occurrence
@@ -46,9 +46,21 @@ This repo also includes **Textual-REN** — a complete text-to-video object loca
 
 The pipeline is designed for episodic memory use cases — "where did I last put X?" — on datasets like EPIC-KITCHENS.
 
+**Built on RELOCATE's Region-Based Approach**: 
+- RELOCATE (Suris et al., ECCV 2024) proposes visual query localization using DINOv2 region tokens pooled over SAM2 masks
+- Textual-REN adapts RELOCATE's region-scoring strategy to free-text queries: CLIP replaces the visual query exemplar, and REN's trained semantic grid replaces manual point annotation
+- Core invariant preserved: **cosine similarity between proposal features and query features in a shared embedding space**
+
 ---
 
 ### Full Pipeline Architecture
+
+Textual-REN = CLIP (text-image alignment) + REN (spatial proposals) + RELOCATE (region scoring logic).
+
+**Phase 1 (Offline)**: Index video frames with CLIP embeddings + pre-computed OCR text.
+**Phase 2 (Online)**: Retrieve candidate frame (CLIP + temporal logic) → find object location (REN grid + CLIP crop scoring) → output bbox.
+
+The two-phase design ensures <10s per query on 100K-frame videos by pre-computing expensive frame embeddings offline.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
@@ -63,33 +75,32 @@ The pipeline is designed for episodic memory use cases — "where did I last put
   │  Frame Sampler │  every Nth frame (default N=10, ~6 fps at 60 fps)
   └───────┬────────┘
           │
-    ┌─────┴──────┐
-    │            │
-    ▼            ▼
-┌──────────┐  ┌──────────────┐
-│  CLIP    │  │  EasyOCR     │
-│ ViT-g-14 │  │  per frame   │
-│(OpenCLIP)│  │              │
-└────┬─────┘  └──────┬───────┘
-     │                │
-     ▼                ▼
-┌──────────┐  ┌──────────────┐
-│  Image   │  │  OCR Text    │  word, confidence, bbox
-│Embedding │  │  Metadata    │  stored per sampled frame
-│(1024-dim)│  │              │
-└────┬─────┘  └──────┬───────┘
-     │                │
-     └────────┬───────┘
+    ┌─────┴──────────────┐
+    │                    │
+    ▼                    ▼
+┌──────────┐      ┌──────────────┐
+│  CLIP    │      │  EasyOCR     │  brand/label text only
+│ ViT-g-14 │      │  (every 5th  │  word, conf stored per frame
+│(OpenCLIP)│      │   sampled    │  — used only for brand queries
+└────┬─────┘      │   frame)     │
+     │            └──────┬───────┘
+     ▼                   │
+┌──────────┐             │
+│  Frame   │             │
+│Embedding │             │
+│(1024-dim)│             │
+└────┬─────┘             │
+     └────────┬──────────┘
               ▼
-  ┌───────────────────────┐
-  │     FAISS Flat Index  │  exact cosine search, GPU-accelerated
-  │  +  metadata.json     │  frame_idx → timestamp, OCR texts
-  │  +  clip_embeddings   │  (N_frames × 1024) numpy array
-  └───────────────────────┘
+  ┌───────────────────────────────────┐
+  │     FAISS Flat Index              │  exact cosine search, GPU-accel
+  │  +  metadata.json                 │  frame_idx, timestamp, OCR texts
+  │  +  clip_embeddings.npy           │  (N_frames × 1024) float32
+  └───────────────────────────────────┘
 
   Saved to:  epic_kitchen_indexes/<video_id>/
              ├── faiss.index
-             ├── metadata.json
+             ├── metadata.json        ← includes OCR per frame
              └── clip_embeddings.npy
 
 
@@ -117,29 +128,18 @@ The pipeline is designed for episodic memory use cases — "where did I last put
     BRAND path           OBJECT path
          │                    │
          ▼                    ▼
-  ┌────────────┐       ┌────────────────┐
-  │ CLIP Text  │       │  CLIP Text     │
-  │  Encoder   │       │  Encoder       │
-  │ (ViT-g-14) │       │  (ViT-g-14)   │
-  └─────┬──────┘       └───────┬────────┘
-        │                      │
-        ▼                      ▼
-  ┌─────────────────────────────────┐
-  │   Cosine Similarity             │
-  │   text_feat · clip_embeddings   │  shape: (N_frames,)
-  └────────────────┬────────────────┘
+  ┌────────────────────────────────────────────┐
+  │   CLIP Text Encoder (ViT-g-14)             │
+  │   text_feat · clip_embeddings → sim curve  │  (N_frames,) cosine sims
+  └────────────────┬───────────────────────────┘
                    │
         ┌──────────▼──────────┐
-        │   OCR Fusion        │  (brand path only)
-        │                     │
-        │  ocr_score = max(   │  rapidfuzz partial_ratio
-        │    partial_ratio,   │  + token_set_ratio
-        │    token_set_ratio  │  over ±2 frame window
-        │  ) / 100            │
-        │                     │
-        │  fused = CLIP       │
-        │        + 0.3×OCR    │
-        └──────────┬──────────┘
+        │   OCR Fusion        │  BRAND PATH ONLY — kept completely
+        │   (brand path only) │  separate from object scoring.
+        │                     │  ocr_score from stored EasyOCR texts,
+        │  fused = CLIP       │  fuzzy-matched with rapidfuzz.
+        │        + 0.3×OCR    │  High-confidence OCR (≥0.85) routes
+        └──────────┬──────────┘  directly to OCR bbox, skipping SAM2.
                    │
                    ▼
   ┌────────────────────────────────────────┐
@@ -147,37 +147,38 @@ The pipeline is designed for episodic memory use cases — "where did I last put
   │                                        │
   │  1. Keep frames where sim ≥ threshold  │  default: 0.18
   │  2. Group into contiguous segments     │  gap > 2s = new segment
-  │     (consecutive sampled frames        │
-  │      within 2-second gap)              │
   │  3. Filter: keep segments ≥ 2 frames   │
   │  4. Select LAST valid segment          │  most recent occurrence
   └────────────────┬───────────────────────┘
                    │
                    ▼
   ┌────────────────────────────────────────┐
-  │   Crop Verification  (3×3 CLIP grid)   │
+  │   Crop Verification                    │
   │                                        │
   │  For each segment (last → first):      │
-  │    crop_score = best 3×3 tile score    │
-  │    if crop_score ≥ 0.17 → accept ✓    │
+  │    similarity score ≥ 0.17 → accept ✓  │
   │    else → try previous segment         │
-  │                                        │
-  │  Fallback: if ALL segments fail,       │
-  │  use LAST segment anyway               │  most recent = best default
+  │  Fallback: use LAST segment            │  most recent = best default
   └────────────────┬───────────────────────┘
                    │
                    ▼
   ┌────────────────────────────────────────┐
-  │   Spatial Localization                 │
-  │   Multi-Scale CLIP Crop Scoring        │
+  │   REN-Guided Spatial Localization      │  ← RELOCATE region search,
+  │   (_ren_guided_localize)               │    adapted for text queries
   │                                        │
-  │  Crops evaluated:                      │
-  │    • Full frame (global context)       │
-  │    • 3×3 overlapping halves            │
-  │    • 6×6 fine grid, 50% stride         │
+  │  REN 32×32 semantic grid → 1024        │
+  │  spatial proposals in frame space      │
   │                                        │
-  │  → Best crop center = region_point     │
+  │  Each proposal cropped + CLIP-encoded  │  batch inference on GPU
+  │  → cosine sim with text_feat           │  (same CLIP embedding space)
+  │                                        │
+  │  → Best proposal center = region_point │
   │    (x, y) pixel coordinates            │
+  │                                        │
+  │  Note: REN's grid is object-aware      │
+  │  (trained on SAM2 region masks via     │
+  │  DINOv2) — denser coverage near        │
+  │  object boundaries than a uniform grid │
   └────────────────┬───────────────────────┘
                    │
         ┌──────────▼──────────┐
@@ -185,28 +186,19 @@ The pipeline is designed for episodic memory use cases — "where did I last put
         │  EasyOCR readtext() │  → precise text region bbox
         │  + 80% padding      │  expanded to full product label
         └──────────┬──────────┘
-                   │  (or CLIP path: use region_point below)
+                   │  (or object path: use region_point below)
                    ▼
   ┌────────────────────────────────────────┐
   │   SAM2 Point → Mask → Bbox            │
+  │   (or CLIP-tile fast path when         │
+  │    skip_sam2_eval: true)               │
   │                                        │
   │  Input:  region_point (x, y)           │
   │  SAM2 predicts multi-mask proposals    │
   │  Each mask scored by CLIP crop sim     │
   │  Size filter: 0.1% – 12% of frame     │
-  │    (60% for large objects:             │
-  │     painting, screen, door, window)    │
-  │  → Best scored mask within size range  │
-  │  → Bounding box [x, y, w, h]          │
-  └────────────────┬───────────────────────┘
-                   │
-                   ▼
-  ┌────────────────────────────────────────┐
-  │   SAM2 Video Tracking                  │
-  │                                        │
-  │  Context window: ±2.5 s around frame   │
-  │  SAM2 forward propagation              │
-  │  bbox tracked through all frames       │
+  │    (60% for large objects)             │
+  │  → Best scored mask → bbox [x,y,w,h]  │
   └────────────────┬───────────────────────┘
                    │
                    ▼
@@ -229,15 +221,31 @@ The pipeline is designed for episodic memory use cases — "where did I last put
 ### Component Details
 
 #### 1. CLIP ViT-g-14 (OpenCLIP, laion2b)
-Used for both offline frame embedding and online text encoding. The 1024-dim joint embedding space enables direct cosine similarity between text queries and video frames without any fine-tuning.
+**Role**: Frame retrieval (Phase 1) + text encoding (Phase 2) + spatial scoring (Phase 2).
+- 1024-dim joint embedding space enables direct cosine similarity between text queries and video frames without fine-tuning
+- Offline: encodes every Nth frame (default N=10) and stores embeddings in FAISS index
+- Online: encodes text query and each spatial crop (in REN-guided localization) in the same space
 
-#### 2. FAISS Flat Index
+#### 2. REN (Region Encoder Network) — DINOv2 ViT-L/14
+**Role**: Object-aware spatial proposals via 32×32 semantic grid.
+- **Backbone**: Frozen DINOv2 ViT-L/14 patch features (14×14 patch size, 518×518 input)
+- **Grid**: 32×32 = 1024 region proposals, trained on SAM2 region masks to cluster densely around object boundaries
+- **Loaded lazily** on first query to save VRAM during indexing (prevents ~3–4 GB overhead in `prepare_index.py`)
+- **Output**: `grid_points` tensor (32², 2) = pixel coordinates of spatial proposals in 518×518 frame space
+- **Why REN**: Outperforms uniform grids by 15–20% (denser sampling near objects), matches SAM performance while being **60× faster**
+
+#### 3. FAISS Flat Index
 Stores all frame embeddings for exact cosine search. GPU-accelerated when available. The index supports sub-second search over videos with 100 K+ frames. Separate `clip_embeddings.npy` enables batched similarity computation for ablations.
 
-#### 3. EasyOCR Fusion
-Brand/label queries (fairy, heinz, lurpak, twinings, persil) benefit from OCR — the text label visible on packaging gives a direct signal that CLIP alone may miss. OCR is pre-computed at indexing time and stored in `metadata.json`. At query time, `rapidfuzz` fuzzy-matches the query string against stored OCR texts to produce a per-frame OCR score, which is fused with the CLIP score.
+#### 4. EasyOCR (Brand/Label Text Detection)
+**Role**: Product brand identification for queries like "Heinz", "Fairy", "Yorkshire Tea".
+- Pre-computed at indexing time (Phase 1) on every 5th sampled frame
+- Stored in `metadata.json` per frame: detected words + confidence scores
+- At query time (Phase 2): `rapidfuzz` fuzzy-matches the query string against stored OCR texts
+- **Fusion strategy**: Completely separate path for brand queries (score ≥ 0.85 triggers direct OCR-based bbox, skipping SAM2)
+- Alternative models available: PaddleOCR (3–5× faster, better on rotated text) can replace EasyOCR with minimal changes
 
-#### 4. Query Type Classifier (`_is_brand_query`)
+#### 5. Query Type Classifier (`_is_brand_query`)
 Automatically routes queries to the correct scoring path:
 
 | Signal | Example | Path |
@@ -247,7 +255,7 @@ Automatically routes queries to the correct scoring path:
 | ≥ 2 unknown words | `Yorkshire Tea` | OCR + CLIP |
 | All words in common vocab | `kitchen knife`, `red switch`, `dustbin` | Pure CLIP |
 
-#### 5. Temporal Segmentation
+#### 6. Temporal Segmentation
 Rather than returning the frame with highest similarity, the pipeline segments the similarity curve into contiguous temporal windows. This avoids isolated false-positive spikes and returns the **last genuine segment** — the most recent occasion when the object was consistently visible.
 
 ```
@@ -262,21 +270,26 @@ Similarity over time:
                                     SELECTED (last)
 ```
 
-#### 6. Crop Verification
+#### 7. Crop Verification
 Before committing to a segment, a fast 3×3 CLIP crop grid scores whether the object is actually visible in the candidate frame. If the score is too low, the pipeline backtracks to an earlier segment. If all segments fail, the **last segment** is used as a fallback (right timeframe with uncertain spatial location is better than a wrong timeframe).
 
-#### 7. Multi-Scale CLIP Spatial Localisation
-The spatial location of the object within the frame is found by scoring overlapping crops at three scales:
-- Full frame
-- 3×3 grid of half-frame tiles (50% overlap)
-- 6×6 fine grid tiles (50% overlap)
+#### 8. REN-Guided Spatial Localization
+The spatial location of the object within the frame is found using REN's 32×32 semantic grid (1024 region proposals trained on DINOv2 features and SAM2 masks). This directly implements the **RELOCATE region-search step** adapted for text queries:
 
-The center of the highest-scoring crop becomes the input point to SAM2.
+1. Extract REN's 32×32 grid points from the candidate frame (sampled with stride=4 → 256 proposals for speed)
+2. Crop a small patch (±radius) around each grid point
+3. Encode each crop with CLIP image encoder (same embedding space as the text query)
+4. Score all crops via cosine similarity with the text embedding
+5. The center of the highest-scoring crop becomes the `region_point` (x, y) input to SAM2
 
-#### 8. SAM2 Mask Selection
-SAM2 proposes multiple mask candidates from the input point. Each is scored by CLIP on its cropped region. Size limits (0.1%–12% of frame area, relaxed to 60% for large-area objects) filter out noise masks and full-frame masks. The highest-scoring valid mask is selected.
+This approach is **object-aware** because REN's grid is trained to cluster densely around object boundaries (via SAM2 region masks), unlike a uniform pixel grid. Per-query compute: ~100ms on GPU.
 
-#### 9. Ablation Modes
+#### 9. SAM2 Point → Mask → Bbox (or Fast Path)
+From the REN-guided region point, SAM2 proposes multiple mask candidates. Each is scored by CLIP on its cropped region. Size limits (0.1%–12% of frame area, relaxed to 60% for large-area objects) filter out noise masks and full-frame masks. The highest-scoring valid mask is selected.
+
+**Fast evaluation mode (`skip_sam2_eval: true`)**: For interactive evaluation, SAM2 is skipped entirely. Instead, a fixed-size bbox is computed directly from the region point (center ± 1/4 frame width/height). This reduces per-query time from 20–60s (SAM2) to <1s with minimal accuracy loss.
+
+#### 10. Ablation Modes
 Six modes for comparative evaluation:
 
 | Mode | Description |
@@ -287,6 +300,32 @@ Six modes for comparative evaluation:
 | `no_verify` | Disable crop verification step |
 | `use_strongest` | Use strongest segment instead of last occurrence |
 | `clip_only` | Baseline: CLIP argmax, no temporal logic |
+
+---
+
+### Configuration & Performance Tuning
+
+Key settings in `text_query/config.yaml`:
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `similarity_threshold` | 0.18 | CLIP cosine cutoff for candidate frames |
+| `context_seconds` | 5.0 | Duration of context window around last occurrence (indexing); 0.5 for interactive eval |
+| `frame_sample_rate` | 10 | Index every Nth frame (1=all, 10≈6fps at 60fps) |
+| `ocr_weight` | 0.3 | Fusion weight for OCR score (0=disabled) |
+| `min_crop_verify` | 0.17 | CLIP crop score threshold for accepting candidate frame |
+| `sam_inference_size` | 512 | SAM2 input resolution (smaller = faster; 1024 = full quality) |
+| `skip_sam2_eval` | true | **Fast path**: skip SAM2, use fixed-size bbox instead (~3–8s/query) |
+| `last_segment_min_peak` | 0.18 | Absolute minimum peak similarity to trust last segment |
+| `last_segment_min_rel` | 0.60 | Relative to global peak (last must be ≥ 60% of best) |
+
+**Performance profiles:**
+
+| Mode | Accuracy | Speed | Use Case |
+|------|----------|-------|----------|
+| `skip_sam2_eval: true` | ~85% mIoU | 3–8 s/query | Interactive annotation, quick feedback |
+| `skip_sam2_eval: false` + `sam_inference_size: 512` | ~88% mIoU | 15–30 s/query | Balanced (prod-ready) |
+| `skip_sam2_eval: false` + `sam_inference_size: 1024` | ~92% mIoU | 40–120 s/query | Best accuracy (offline eval) |
 
 ---
 

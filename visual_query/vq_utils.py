@@ -1,6 +1,7 @@
 import os
 import sys
 import math
+import hashlib
 import cv2
 import numpy as np
 import itertools
@@ -17,6 +18,30 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor  # type: ignore
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+_SAM2_PREDICTOR_CACHE = {}
+_SAM2_MASK_CACHE = {}
+
+
+def _frame_cache_key(frame):
+    sample = frame[::8, ::8]
+    return hashlib.sha1(sample.tobytes()).hexdigest()
+
+
+def _bbox_cache_key(bbox):
+    return tuple(float(v) for v in bbox)
+
+
+def _point_cache_key(point):
+    return tuple(float(v) for v in point)
+
+
+def _get_sam2_predictor(sam2_ckpt, tracker_param):
+    cache_key = (sam2_ckpt, tracker_param, device)
+    if cache_key not in _SAM2_PREDICTOR_CACHE:
+        sam2 = build_sam2(tracker_param, sam2_ckpt, device=device, apply_postprocessing=False)
+        _SAM2_PREDICTOR_CACHE[cache_key] = SAM2ImagePredictor(sam2)
+    return _SAM2_PREDICTOR_CACHE[cache_key]
 
 
 class CenterPadding(torch.nn.Module):
@@ -257,39 +282,198 @@ def get_sam_regions(sam, frames, bboxes=None, input_points=None, img_resolution=
     return masks
 
 
-def get_sam_region_from_bbox(sam2_ckpt, tracker_param, frames, bboxes):
+def get_sam_region_from_bbox(sam2_ckpt, tracker_param, frames, bboxes, use_fallback=True,
+                             inference_size=1024, cache_enabled=True):
+    """
+    Extract segmentation masks from bounding boxes using SAM2, with fallback.
+    
+    Args:
+        sam2_ckpt: SAM2 checkpoint path
+        tracker_param: SAM2 config parameter
+        frames: Input frames
+        bboxes: Bounding boxes in format [x, y, width, height]
+        use_fallback: If True and SAM2 fails, create mask directly from bbox
+    
+    Returns:
+        masks: List of segmentation masks
+    """
     masks = []
-    predictor = SAM2ImagePredictor(build_sam2(f'{tracker_param}', sam2_ckpt, device=device))
-    for frame, bbox in zip(frames, bboxes):
-        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
-            predictor.set_image(cv2.GaussianBlur(frame, (3, 3), 0))
-            x, y, width, height = bbox
-            mask, _, _ = predictor.predict(
-                point_coords=None,
-                point_labels=None,
-                box=np.array([x, y, x + width, y + height])[None],
-                multimask_output=False,
-            )
-            masks.append(refine_mask(mask[0]))
+    predictor = _get_sam2_predictor(sam2_ckpt, tracker_param)
+
+    try:
+        for frame, bbox in zip(frames, bboxes):
+            cache_key = None
+            if cache_enabled:
+                cache_key = ('bbox', sam2_ckpt, tracker_param, inference_size, _frame_cache_key(frame), _bbox_cache_key(bbox))
+                cached_mask = _SAM2_MASK_CACHE.get(cache_key)
+                if cached_mask is not None:
+                    masks.append(cached_mask)
+                    continue
+
+            with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
+                original_h, original_w = frame.shape[:2]
+                scale = min(1.0, float(inference_size) / float(max(original_h, original_w)))
+                if scale < 1.0:
+                    resized_frame = cv2.resize(frame, (max(1, int(original_w * scale)), max(1, int(original_h * scale))))
+                    x, y, width, height = bbox
+                    scaled_bbox = np.array([[x * scale, y * scale, (x + width) * scale, (y + height) * scale]])
+                else:
+                    resized_frame = frame
+                    x, y, width, height = bbox
+                    scaled_bbox = np.array([[x, y, x + width, y + height]])
+
+                predictor.set_image(cv2.GaussianBlur(resized_frame, (3, 3), 0))
+                mask, _, _ = predictor.predict(
+                    point_coords=None,
+                    point_labels=None,
+                    box=scaled_bbox,
+                    multimask_output=False,
+                )
+                mask = mask[0]
+                if scale < 1.0:
+                    mask = cv2.resize(mask.astype(np.uint8), (original_w, original_h), interpolation=cv2.INTER_NEAREST)
+                refined = refine_mask(mask)
+                masks.append(refined)
+                if cache_key is not None:
+                    _SAM2_MASK_CACHE[cache_key] = refined
+    except Exception as e:
+        print(f"Warning: SAM2 bbox extraction failed: {e}")
+        if use_fallback:
+            print("Using fallback bbox-to-mask conversion")
+            # Fallback: create masks directly from bounding boxes
+            for frame, bbox in zip(frames, bboxes):
+                mask = _create_mask_from_bbox(frame, bbox)
+                masks.append(mask)
+        else:
+            raise
+    
     return masks
 
 
-def get_sam_region_from_points(sam2_ckpt, tracker_param, frames, points):
+def _create_mask_from_bbox(frame, bbox):
+    """
+    Create a binary mask directly from a bounding box.
+    
+    Args:
+        frame: Input frame (H x W x 3)
+        bbox: Bounding box in format [x, y, width, height]
+    
+    Returns:
+        mask: Binary mask with 1s inside the bbox region
+    """
+    height, width = frame.shape[:2]
+    x, y, w, h = bbox
+    
+    # Create empty mask
+    mask = np.zeros((height, width), dtype=np.uint8)
+    
+    # Clip bbox to frame boundaries
+    x_min = max(0, int(x))
+    y_min = max(0, int(y))
+    x_max = min(width, int(x + w))
+    y_max = min(height, int(y + h))
+    
+    # Fill mask region
+    mask[y_min:y_max, x_min:x_max] = 1
+    
+    return mask
+
+
+def get_sam_region_from_points(sam2_ckpt, tracker_param, frames, points, use_fallback=True,
+                               inference_size=1024, cache_enabled=True):
+    """
+    Extract segmentation masks from points using SAM2, with fallback to point-based bbox.
+    
+    Args:
+        sam2_ckpt: SAM2 checkpoint path
+        tracker_param: SAM2 config parameter
+        frames: Input frames
+        points: Point coordinates
+        use_fallback: If True and SAM2 fails, create mask from point with default size
+    
+    Returns:
+        masks: List of segmentation masks
+    """
     masks = []
-    predictor = SAM2ImagePredictor(build_sam2(f'{tracker_param}', sam2_ckpt, device=device))
-    for frame, point in zip(frames, points):
-        with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
-            predictor.set_image(cv2.GaussianBlur(frame, (3, 3), 0))
-            y, x = point
-            mask, _, _ = predictor.predict(
-                point_coords=np.array([[x, y]]),
-                point_labels=np.array([1]),
-                box=None,
-                multimask_output=True,
-            )
-            mask = [refine_mask(m) for m in mask]
-            masks.append(mask)
+    predictor = _get_sam2_predictor(sam2_ckpt, tracker_param)
+
+    try:
+        for frame, point in zip(frames, points):
+            cache_key = None
+            if cache_enabled:
+                cache_key = ('point', sam2_ckpt, tracker_param, inference_size, _frame_cache_key(frame), _point_cache_key(point))
+                cached_mask = _SAM2_MASK_CACHE.get(cache_key)
+                if cached_mask is not None:
+                    masks.append(cached_mask)
+                    continue
+
+            with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
+                original_h, original_w = frame.shape[:2]
+                scale = min(1.0, float(inference_size) / float(max(original_h, original_w)))
+                if scale < 1.0:
+                    resized_frame = cv2.resize(frame, (max(1, int(original_w * scale)), max(1, int(original_h * scale))))
+                    y, x = point
+                    point_scaled = np.array([[x * scale, y * scale]])
+                else:
+                    resized_frame = frame
+                    y, x = point
+                    point_scaled = np.array([[x, y]])
+
+                predictor.set_image(cv2.GaussianBlur(resized_frame, (3, 3), 0))
+                mask, _, _ = predictor.predict(
+                    point_coords=point_scaled,
+                    point_labels=np.array([1]),
+                    box=None,
+                    multimask_output=True,
+                )
+                mask = [refine_mask(m) for m in mask]
+                if scale < 1.0:
+                    mask = [cv2.resize(m.astype(np.uint8), (original_w, original_h), interpolation=cv2.INTER_NEAREST) for m in mask]
+                masks.append(mask)
+                if cache_key is not None:
+                    _SAM2_MASK_CACHE[cache_key] = mask
+    except Exception as e:
+        print(f"Warning: SAM2 region extraction failed: {e}")
+        if use_fallback:
+            print("Using fallback point-to-mask conversion")
+            # Fallback: create masks around the point with default region size
+            for frame, point in zip(frames, points):
+                mask = _create_mask_from_point(frame, point, window_size=64)
+                masks.append([mask])
+        else:
+            raise
+    
     return masks
+
+
+def _create_mask_from_point(frame, point, window_size=64):
+    """
+    Create a binary mask from a point location with a centered square window.
+    
+    Args:
+        frame: Input frame (H x W x 3)
+        point: Point coordinates (y, x)
+        window_size: Size of the square window around the point
+    
+    Returns:
+        mask: Binary mask with 1s in the window around the point
+    """
+    height, width = frame.shape[:2]
+    y, x = int(point[0]), int(point[1])
+    
+    # Create empty mask
+    mask = np.zeros((height, width), dtype=np.uint8)
+    
+    # Define window boundaries
+    y_min = max(0, y - window_size // 2)
+    y_max = min(height, y + window_size // 2)
+    x_min = max(0, x - window_size // 2)
+    x_max = min(width, x + window_size // 2)
+    
+    # Fill mask region
+    mask[y_min:y_max, x_min:x_max] = 1
+    
+    return mask
 
 
 def generate_frame_tokens(feature, masks, pooling_method='average'):
@@ -373,6 +557,8 @@ def sliding_window_cropping(image, crop_size, overlap=0.2):
 
 def mask_to_bbox(mask):
     rows, cols = np.where(mask == 1)
+    if rows.size == 0 or cols.size == 0:
+        return torch.tensor([0, 0, 0, 0])
     x_min = np.min(cols)
     y_min = np.min(rows)
     x_max = np.max(cols)
@@ -383,13 +569,43 @@ def mask_to_bbox(mask):
 
 
 def get_sam_pooled_tokens(frames, bboxes, sam2_ckpt, tracker_param, patch_size, config, chunk_size=8):
+    """
+    Generate pooled tokens from bboxes using SAM2 masks, with fallback support.
+    
+    Args:
+        frames: Input frames
+        bboxes: Bounding boxes in format [x, y, width, height]
+        sam2_ckpt: SAM2 checkpoint path
+        tracker_param: SAM2 config parameter
+        patch_size: Patch size for feature upsampling
+        config: Configuration dictionary
+        chunk_size: Batch size for processing
+    
+    Returns:
+        tokens: Pooled tokens
+    """
     all_tokens = []
+    text_query_config = config.get('text_query', {}) if isinstance(config, dict) else {}
+    inference_size = text_query_config.get('sam_inference_size', 1024)
+    cache_enabled = text_query_config.get('sam_cache_results', True)
     for i in range(0, frames.shape[0], chunk_size):
         frames_chunk = frames[i:i + chunk_size]
         bboxes_chunk = bboxes[i:i + chunk_size]
 
-        # Generate the masks
-        masks = get_sam_region_from_bbox(sam2_ckpt, tracker_param, frames_chunk, bboxes_chunk)
+        # Generate the masks with fallback support
+        try:
+            masks = get_sam_region_from_bbox(
+                sam2_ckpt,
+                tracker_param,
+                frames_chunk,
+                bboxes_chunk,
+                inference_size=inference_size,
+                cache_enabled=cache_enabled,
+            )
+        except Exception as e:
+            print(f"Warning: Failed to get SAM masks in get_sam_pooled_tokens: {e}")
+            # Create masks directly from bboxes as fallback
+            masks = [_create_mask_from_bbox(frame, bbox) for frame, bbox in zip(frames_chunk, bboxes_chunk)]
 
         # Generate the features
         frames_features = extract_image_features(frames_chunk, config)
@@ -403,6 +619,14 @@ def get_sam_pooled_tokens(frames, bboxes, sam2_ckpt, tracker_param, patch_size, 
         # Generate query tokens
         for mask, frame_features in zip(masks, frames_features):
             r_1, r_2 = np.where(mask == 1)
+            if len(r_1) == 0:  # Handle empty masks
+                # Use center region as fallback
+                center_h, center_w = frame_features.shape[1] // 2, frame_features.shape[2] // 2
+                window = 20
+                r_1 = np.arange(max(0, center_h - window), min(frame_features.shape[1], center_h + window))
+                r_2 = np.arange(max(0, center_w - window), min(frame_features.shape[2], center_w + window))
+                r_1, r_2 = np.meshgrid(r_1, r_2)
+                r_1, r_2 = r_1.flatten(), r_2.flatten()
             features = frame_features[:, r_1, r_2]
             feature_dims = features.shape[0]
             token = features.reshape(feature_dims, -1).mean(1)[None]
@@ -413,13 +637,57 @@ def get_sam_pooled_tokens(frames, bboxes, sam2_ckpt, tracker_param, patch_size, 
 
 
 def point_to_bbox(frame, object_point, query_tokens, query_frames, query_bboxes, sam2_ckpt, tracker_param, patch_size, config):
+    """
+    Convert a point to a bounding box by generating a mask and extracting bbox from it.
+    Includes fallback for when SAM2 is unavailable.
+    
+    Args:
+        frame: Input frame
+        object_point: Point coordinates (y, x)
+        query_tokens: Query tokens for similarity matching
+        query_frames: Query frames (if query_tokens is None)
+        query_bboxes: Query bboxes (if query_tokens is None)
+        sam2_ckpt: SAM2 checkpoint path
+        tracker_param: SAM2 config parameter
+        patch_size: Patch size for feature upsampling
+        config: Configuration dictionary
+    
+    Returns:
+        object_bbox: Bounding box in format [x, y, width, height]
+    """
     if query_tokens is None:
         assert (query_frames is not None) and (query_bboxes is not None)
         query_tokens = get_sam_pooled_tokens(query_frames, query_bboxes, sam2_ckpt, tracker_param, patch_size, config)
 
     # Generate candidate mask
     points = np.array([object_point], dtype=np.float32)
-    object_masks = get_sam_region_from_points(sam2_ckpt, tracker_param, frame[None], points)[0]
+    try:
+        text_query_config = config.get('text_query', {}) if isinstance(config, dict) else {}
+        inference_size = text_query_config.get('sam_inference_size', 1024)
+        cache_enabled = text_query_config.get('sam_cache_results', True)
+        object_masks = get_sam_region_from_points(
+            sam2_ckpt,
+            tracker_param,
+            frame[None],
+            points,
+            inference_size=inference_size,
+            cache_enabled=cache_enabled,
+        )[0]
+    except Exception as e:
+        print(f"Error in point_to_bbox: SAM2 failed - {e}. Using fallback.")
+        # Fallback: create mask around point with default size and directly extract bbox
+        mask = _create_mask_from_point(frame, object_point, window_size=64)
+        object_bbox = mask_to_bbox(mask)
+        torch.cuda.empty_cache()
+        return object_bbox
+    
+    # If no masks were generated or all are empty, use fallback
+    if not object_masks or all(np.sum(m) == 0 for m in object_masks):
+        print("Warning: SAM2 generated empty masks. Using fallback bbox.")
+        mask = _create_mask_from_point(frame, object_point, window_size=64)
+        object_bbox = mask_to_bbox(mask)
+        torch.cuda.empty_cache()
+        return object_bbox
     
     # Generate candidate features
     frame_features = extract_image_features(frame[None], config)
@@ -432,6 +700,9 @@ def point_to_bbox(frame, object_point, query_tokens, query_frames, query_bboxes,
     candidate_similarities = []
     for object_mask in object_masks:
         r_1, r_2 = np.where(object_mask == 1)
+        if len(r_1) == 0:  # Skip empty masks
+            candidate_similarities.append(-1)
+            continue
         candidate_features = frame_features[:, r_1, r_2]
         feature_dims = candidate_features.shape[0]
         candidate_token = candidate_features.reshape(feature_dims, -1).mean(1)[None]
@@ -441,9 +712,18 @@ def point_to_bbox(frame, object_point, query_tokens, query_frames, query_bboxes,
         candidate_similarity = torch.max(cosine_scores, dim=1)[0].item()
         candidate_similarities.append(candidate_similarity)
 
-    # Get object bbox
-    object_mask = object_masks[candidate_similarities.index(max(candidate_similarities))]
-    object_bbox = mask_to_bbox(object_mask)
+    # Get object bbox from best mask
+    best_mask_idx = np.argmax(candidate_similarities)
+    object_mask = object_masks[best_mask_idx]
+    
+    # If best mask is empty, fall back to point-based mask
+    if np.sum(object_mask) == 0:
+        print("Best mask is empty. Using fallback point-based mask.")
+        mask = _create_mask_from_point(frame, object_point, window_size=64)
+        object_bbox = mask_to_bbox(mask)
+    else:
+        object_bbox = mask_to_bbox(object_mask)
+    
     torch.cuda.empty_cache()
     return object_bbox
 

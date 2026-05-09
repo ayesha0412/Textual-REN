@@ -90,6 +90,17 @@ class VideoIndexer:
         if self.use_gpu:
             self.gpu_resources = faiss.StandardGpuResources()
 
+    # How many frames to encode in one GPU CLIP forward pass.
+    # Larger = faster (fewer kernel launches), but uses more VRAM.
+    # 64 is safe on 8 GB+; lower to 32 if you hit OOM.
+    CLIP_BATCH_SIZE = 64
+
+    # Run EasyOCR only every Nth *sampled* frame.
+    # At sample_rate=10 + OCR_STRIDE=5, OCR fires every 50 raw frames
+    # (~0.8 s at 60 fps) — enough to catch label text without reading
+    # thousands of nearly-identical frames.
+    OCR_STRIDE = 5
+
     def index_video(
         self,
         video_path: str,
@@ -101,21 +112,31 @@ class VideoIndexer:
         """
         Index a video: extract CLIP image embeddings and build FAISS index.
 
-        REN region tokens live in DINOv2 space (vision-only) and cannot be compared
-        to CLIP text embeddings — so they are skipped by default for text-query mode.
-        Pass skip_ren=False only if you need the tokens for a separate visual-query pipeline.
+        Performance notes
+        -----------------
+        * CLIP is processed in batches of CLIP_BATCH_SIZE (default 64) so the
+          GPU runs at full utilisation instead of stalling between single-frame
+          calls.
+        * torch.cuda.empty_cache() is NOT called inside the frame loop — doing
+          so forces a GPU pipeline flush on every frame, costing minutes on
+          long videos.
+        * EasyOCR is run only every OCR_STRIDE sampled frames (default every 5)
+          because label text changes far more slowly than the frame rate.
+        * Frames are read sequentially (no per-frame seek) which is 10–50×
+          faster than cap.set(POS_FRAMES) on compressed video files.
 
         Args:
             video_path:  Path to video file
             output_dir:  Directory to save index files
             sample_rate: Process every Nth frame (default: from config)
             skip_ren:    Skip expensive REN token extraction (default: True)
+            skip_ocr:    Skip EasyOCR extraction (default: False)
 
         Returns:
-            metadata: Dict with index_path, num_frames, fps, etc.
+            metadata dict with index_path, num_frames, fps, etc.
         """
         if sample_rate is None:
-            sample_rate = self.config['text_query'].get('frame_sample_rate', 2)
+            sample_rate = self.config['text_query'].get('frame_sample_rate', 10)
 
         os.makedirs(output_dir, exist_ok=True)
         print(f"Indexing video: {video_path}")
@@ -129,82 +150,93 @@ class VideoIndexer:
         frame_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Frames we will actually process
-        sampled_indices = list(range(0, total_frames, sample_rate))
-        print(f"  Source : {total_frames} frames @ {fps:.2f} fps, {frame_width}x{frame_height}")
-        print(f"  Sampling: every {sample_rate}th frame → {len(sampled_indices)} frames to process")
+        n_sampled = max(1, total_frames // sample_rate)
+        print(f"  Source  : {total_frames} frames @ {fps:.2f} fps  "
+              f"({frame_width}×{frame_height})")
+        print(f"  Sampling: every {sample_rate}th frame → ~{n_sampled} frames")
+        print(f"  CLIP batch size : {self.CLIP_BATCH_SIZE}")
 
-        clip_embeddings  = []
-        frame_metadata   = []
-        all_region_tokens = []
-
+        do_ocr = not skip_ocr and HAS_OCR
         if skip_ren:
-            print("  REN token extraction skipped (not needed for text-query mode)")
-        if skip_ocr or not HAS_OCR:
-            print("  OCR text extraction skipped (brand recognition disabled)")
+            print("  REN   : skipped (not needed for text-query mode)")
+        if not do_ocr:
+            print("  OCR   : skipped")
         else:
-            print("  OCR text extraction enabled (brand/label recognition)")
+            print(f"  OCR   : every {self.OCR_STRIDE} sampled frames "
+                  f"(~{self.OCR_STRIDE * sample_rate / fps:.1f} s intervals)")
             if self.ocr_reader is None:
-                print("  Initializing EasyOCR model on GPU...")
+                print("  Initializing EasyOCR …")
                 self.ocr_reader = easyocr.Reader(
-                    ['en'],
-                    gpu=self.device.type == 'cuda',
-                    verbose=False,
+                    ['en'], gpu=self.device.type == 'cuda', verbose=False
                 )
                 print("  EasyOCR ready.")
 
-        # Direct-seek: jump to each target frame index rather than reading all
-        # frames sequentially.  Avoids exhausting the multi-stream packet budget.
-        for sampled_frame_idx, frame_idx in enumerate(sampled_indices):
-            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        clip_embeddings   = []   # will hold (N, D) float32
+        frame_metadata    = []
+        all_region_tokens = []
+
+        # ── accumulation buffers for CLIP batching ──────────────────────────
+        batch_frames: List[np.ndarray] = []   # BGR frames pending CLIP
+        batch_meta:   List[dict]       = []   # metadata stubs for each frame
+
+        sampled_frame_idx = 0   # counter of frames we actually keep
+
+        # Sequential read — much faster than seeking to every Nth frame on
+        # compressed video, and avoids packet-budget exhaustion on EPIC-Kitchens.
+        raw_frame_idx = 0
+        while True:
             ret, frame = cap.read()
             if not ret:
-                continue   # skip unreadable frames, keep going
+                break
 
-            if sampled_frame_idx % 50 == 0:
-                pct = 100 * sampled_frame_idx / len(sampled_indices)
-                print(f"  [{pct:5.1f}%] frame {frame_idx}/{total_frames}  "
-                      f"({sampled_frame_idx}/{len(sampled_indices)} sampled)", end='\r')
+            if raw_frame_idx % sample_rate == 0:
+                # ── OCR (low-frequency) ──────────────────────────────────────
+                ocr_texts: list = []
+                if do_ocr and sampled_frame_idx % self.OCR_STRIDE == 0:
+                    ocr_texts = self._extract_ocr(frame)
 
-            clip_feat = self._extract_clip_embedding(frame)
-            clip_embeddings.append(clip_feat)
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
-
-            ocr_texts = self._extract_ocr(frame) if (not skip_ocr and HAS_OCR) else []
-            if self.device.type == 'cuda':
-                torch.cuda.empty_cache()
-
-            if not skip_ren:
-                region_tokens = self._extract_region_tokens(frame)
-                region_count  = region_tokens.shape[0] if region_tokens.numel() > 0 else 0
-                frame_metadata.append({
-                    'frame_idx':        frame_idx,
+                stub = {
+                    'frame_idx':         raw_frame_idx,
                     'sampled_frame_idx': sampled_frame_idx,
-                    'timestamp':        frame_idx / fps,
-                    'region_count':     region_count,
-                    'region_start_idx': len(all_region_tokens),
-                    'ocr_texts':        ocr_texts,
-                })
-                if region_count > 0:
-                    all_region_tokens.append(region_tokens.cpu().numpy())
-            else:
-                frame_metadata.append({
-                    'frame_idx':        frame_idx,
-                    'sampled_frame_idx': sampled_frame_idx,
-                    'timestamp':        frame_idx / fps,
-                    'ocr_texts':        ocr_texts,
-                })
+                    'timestamp':         raw_frame_idx / fps,
+                    'ocr_texts':         ocr_texts,
+                }
+                batch_frames.append(frame)
+                batch_meta.append(stub)
+
+                # ── flush CLIP batch ─────────────────────────────────────────
+                if len(batch_frames) >= self.CLIP_BATCH_SIZE:
+                    feats = self._extract_clip_batch(batch_frames)
+                    clip_embeddings.append(feats)
+                    frame_metadata.extend(batch_meta)
+                    pct = 100 * sampled_frame_idx / max(n_sampled, 1)
+                    print(f"  [{pct:5.1f}%] frame {raw_frame_idx}/{total_frames}  "
+                          f"({sampled_frame_idx} sampled)", end='\r')
+                    batch_frames = []
+                    batch_meta   = []
+
+                sampled_frame_idx += 1
+
+            raw_frame_idx += 1
+
+        # flush remaining frames
+        if batch_frames:
+            feats = self._extract_clip_batch(batch_frames)
+            clip_embeddings.append(feats)
+            frame_metadata.extend(batch_meta)
 
         cap.release()
-        print(f"\n  Sampled {len(clip_embeddings)} frames")
+
+        if not clip_embeddings:
+            raise RuntimeError("No frames could be read from the video.")
+
+        clip_embeddings_np = np.vstack(clip_embeddings)   # (N, D)
+        print(f"\n  Done — {len(frame_metadata)} frames indexed")
         if not skip_ren:
             print(f"  Total regions: {sum(m.get('region_count', 0) for m in frame_metadata)}")
 
-        # Stack embeddings
-        clip_embeddings = np.vstack(clip_embeddings)  # (num_frames, clip_dim)
-
         # Build FAISS index on CLIP embeddings
+        clip_embeddings = clip_embeddings_np
         actual_dim = clip_embeddings.shape[1]
         if actual_dim != self.clip_dim:
             print(f"  [Warning] Actual CLIP embedding dim ({actual_dim}) differs from "
@@ -285,31 +317,34 @@ class VideoIndexer:
         except Exception:
             return []
 
-    def _extract_clip_embedding(self, frame: np.ndarray) -> np.ndarray:
+    def _extract_clip_batch(self, frames: List[np.ndarray]) -> np.ndarray:
         """
-        Extract CLIP image embedding from a frame.
+        Extract L2-normalised CLIP embeddings for a batch of BGR frames.
+
+        Processing a batch in one GPU call is ~CLIP_BATCH_SIZE× faster than
+        calling encode_image() once per frame, and avoids the per-call kernel
+        launch overhead that caused 6-hour indexing times.
 
         Args:
-            frame: BGR numpy array (H, W, 3)
+            frames: list of BGR numpy arrays
 
         Returns:
-            L2-normalized embedding (1280,)
+            (len(frames), D) float32 array of L2-normalised embeddings
         """
-        # Convert BGR to RGB and PIL Image
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(rgb_frame)
+        imgs = torch.stack([
+            self.localizer.clip_preprocess(
+                Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
+            )
+            for f in frames
+        ]).to(self.device)
 
-        # Extract CLIP embedding using localizer's preprocess
-        img_tensor = self.localizer.clip_preprocess(pil_image).unsqueeze(0).to(self.device)
-        
         with torch.no_grad(), torch.autocast(
             self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
         ):
-            clip_embedding = self.localizer.clip_model.encode_image(img_tensor).float()
-        
-        # Normalize and return
-        clip_embedding = torch.nn.functional.normalize(clip_embedding, p=2, dim=-1)
-        return clip_embedding.cpu().numpy().astype(np.float32)[0]
+            feats = self.localizer.clip_model.encode_image(imgs).float()
+
+        feats = torch.nn.functional.normalize(feats, p=2, dim=-1)
+        return feats.cpu().numpy().astype(np.float32)
 
     def _extract_region_tokens(self, frame: np.ndarray) -> torch.Tensor:
         """

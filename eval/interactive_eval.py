@@ -199,7 +199,8 @@ def main():
     from query_indexed import IndexedQueryEngine
     engine = IndexedQueryEngine(config, args.index)
 
-    tmp_dir = os.path.join(os.path.dirname(output_path), '_tmp_eval')
+    # Save results permanently (not temp) for presentation to professor
+    results_dir = os.path.join(os.path.dirname(output_path), 'evaluation_results')
     last_vis_path = None
 
     while True:
@@ -229,7 +230,7 @@ def main():
             continue
 
         print(f"\n  Searching: '{query}' ...")
-        q_tmp = os.path.join(tmp_dir, video_id, query.replace(' ', '_'))
+        q_tmp = os.path.join(results_dir, video_id, query.replace(' ', '_'))
         result, debug_path = run_query(engine, query, args.video, q_tmp, config)
 
         if result is None:

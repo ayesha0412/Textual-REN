@@ -17,6 +17,17 @@ text_query:
   patch_size: 8                 # feature patch size for SAM-pooled tokens (DINO)
   save_dir: 'logs/'
 
+  # Keep SAM semantics, but reduce the compute cost during evaluation
+  sam_inference_size: 512       # 1024 = full quality, 768/512 = faster with similar masks
+  sam_cache_results: true       # cache SAM masks for repeated frames/queries
+
+  # SAM2 optimization for evaluation
+  # Set skip_sam2_eval: true  → uses CLIP-tile bbox (instant, no GPU spike, ~25% frame size)
+  # Set skip_sam2_eval: false → uses SAM2 (precise masks, adds 20-60s per query)
+  skip_sam2_eval: true          # fast annotation mode — user can fix bbox with 'f'
+  cache_sam_results: true       # if true, cache SAM2 results per frame
+  use_fast_tokens: false        # if true, use simplified token generation (faster but less accurate)
+
   # FAISS indexing parameters
   faiss:
     # CLIP embedding dimension (OpenCLIP ViT-g-14)

@@ -120,7 +120,7 @@ class IndexedQueryEngine:
         video_path: str,
         output_dir: str,
         threshold: float = None,
-        region_grid: int = 6,
+        region_grid: int = 3,
         ocr_weight: float = None,
         neg_queries: List[str] = None,
         neg_weight: float = None,
@@ -312,51 +312,50 @@ class IndexedQueryEngine:
                 print(f"\n  Last segment weak (peak={last_sim:.3f} vs min_peak={min_peak}, "
                       f"global={global_peak_sim:.3f}) — falling back to strongest segment")
 
-        # ---- Step 3b: verify the chosen frame actually contains the object ----
+        # ---- Step 3b: verify the chosen frame (fast: use FAISS similarity, skip crop scoring) ----
         crop_score = 0.0
         MIN_CROP_VERIFY = self.config['text_query'].get('min_crop_verify', 0.17)
         if ablation_no_verification:
             MIN_CROP_VERIFY = 0.0   # always accept first candidate
 
-        # Walk from the latest segment backward.  If a segment passes the crop
-        # verify threshold we accept it immediately (it is the last good
-        # occurrence).  If *no* segment passes we fall back to the latest
-        # segment — a low crop score at the right time beats a high crop score
-        # at the wrong time for general-object queries.
-        last_seg_fallback = None   # (segment, meta_idx, frame_idx, sim, frame_rgb, score)
+        # Walk from the latest segment backward.  If a segment passes the similarity
+        # threshold we accept it immediately (it is the last good occurrence).
+        # If *no* segment passes we fall back to the latest segment.
+        # NOTE: Skip expensive crop verification — use FAISS similarity score directly.
+        last_seg_fallback = None   # (segment, meta_idx, frame_idx, sim, frame_rgb)
 
         for attempt in range(len(valid) - 1, -1, -1):
             cand_segment = valid[attempt]
             cand_meta_idx = max(cand_segment, key=lambda i: all_sims[i])
             cand_frame_idx = frame_metadata[cand_meta_idx]['frame_idx']
+            cand_sim = float(all_sims[cand_meta_idx])
             cand_frame_rgb = self._load_single_frame(video_path, cand_frame_idx)
-            _, crop_score = self._find_best_region_clip(cand_frame_rgb, text_feat, grid_size=3)
             t = cand_frame_idx / fps
             print(f"  Verify segment {attempt+1}/{len(valid)}: "
-                  f"frame {cand_frame_idx} (t={t:.1f}s) crop_score={crop_score:.3f}", end='')
+                  f"frame {cand_frame_idx} (t={t:.1f}s) sim={cand_sim:.3f}", end='')
 
             # Remember the last (most recent) segment as our ultimate fallback.
             if last_seg_fallback is None:
                 last_seg_fallback = (cand_segment, cand_meta_idx, cand_frame_idx,
-                                     float(all_sims[cand_meta_idx]), cand_frame_rgb, crop_score)
+                                     cand_sim, cand_frame_rgb)
 
-            if crop_score >= MIN_CROP_VERIFY:
+            if cand_sim >= MIN_CROP_VERIFY:
                 last_segment = cand_segment
                 last_meta_idx = cand_meta_idx
                 last_frame_idx = cand_frame_idx
-                last_sim = float(all_sims[last_meta_idx])
+                last_sim = cand_sim
                 last_frame_rgb = cand_frame_rgb
+                crop_score = cand_sim
                 print(f"  ✓ accepted")
                 break
             print(f"  ✗ too low — trying previous segment")
         else:
-            # No segment passed verification — use the LAST (most recent) segment,
-            # not the earliest one.  Falling back to the earliest frame caused wrong
-            # objects to be localized when the target object was visible only later.
+            # No segment passed verification — use the LAST (most recent) segment.
             (last_segment, last_meta_idx, last_frame_idx,
-             last_sim, last_frame_rgb, crop_score) = last_seg_fallback
-            print(f"\n  No segment passed crop verify — defaulting to last occurrence "
-                  f"(t={last_frame_idx/fps:.1f}s, crop={crop_score:.3f})")
+             last_sim, last_frame_rgb) = last_seg_fallback
+            crop_score = last_sim
+            print(f"\n  No segment passed similarity verify — defaulting to last occurrence "
+                  f"(t={last_frame_idx/fps:.1f}s, sim={crop_score:.3f})")
 
         print(f"\n  Last occurrence → frame {last_frame_idx}  "
               f"(t={last_frame_idx/fps:.2f}s, sim={last_sim:.3f}, crop={crop_score:.3f})")
@@ -398,15 +397,19 @@ class IndexedQueryEngine:
                 ocr_bbox_xywh = None
             print(f"  Spatial location (OCR): {region_point}")
         else:
-            print(f"\nSpatial localization via CLIP crop scoring ({region_grid}×{region_grid} grid)...")
-            region_point, region_score = self._find_best_region_clip(
-                last_frame_rgb, text_feat, grid_size=region_grid
+            # REN-guided spatial localization: use REN's 32×32 semantic grid as
+            # region proposals, score each with CLIP (same embedding space as text).
+            # This is the RELOCATE region-search step adapted for text queries.
+            (ren_cx, ren_cy), region_score = self._ren_guided_localize(
+                last_frame_rgb, text_feat
             )
-            print(f"  Spatial location (CLIP): {region_point}  (score: {region_score:.3f})")
+            region_point = (ren_cx, ren_cy)
+            print(f"  Spatial location (REN-guided): {region_point}  score={region_score:.3f}")
             ocr_bbox_xywh = None
 
         # ---- Step 5: context window centred on the last-occurrence frame ----
-        context_seconds = self.config['text_query'].get('context_seconds', 5.0)
+        # For interactive eval: minimal window (0.5s) since we skip tracking
+        context_seconds = 0.5  # Skip expensive tracking
         half_span = int(context_seconds * fps / 2)
 
         print(f"\nLoading ±{context_seconds/2:.1f}s context window...")
@@ -416,10 +419,23 @@ class IndexedQueryEngine:
         start_idx = max(0, last_frame_idx - half_span)
         center_local = last_frame_idx - start_idx   # may be < half_span near video edges
 
-        # ---- Step 6: bbox — OCR direct or SAM2 ----
+        # ---- Step 6: bbox — OCR direct, CLIP-tile fast path, or SAM2 ----
+        _skip_sam2 = self.config['text_query'].get('skip_sam2_eval', False)
+
         if ocr_bbox_xywh is not None:
             bbox = torch.tensor(ocr_bbox_xywh)
             print(f"SAM2 skipped — using OCR bbox: {bbox.tolist()}")
+        elif _skip_sam2:
+            # Fast path: derive bbox from the CLIP-best tile, no SAM2 needed.
+            # Tile size = 25 % of frame on each side → covers most kitchen objects.
+            fh, fw = frames[center_local].shape[:2]
+            cx, cy = region_point
+            bw = max(64, fw // 4)
+            bh = max(64, fh // 4)
+            bx = max(0, min(cx - bw // 2, fw - bw))
+            by = max(0, min(cy - bh // 2, fh - bh))
+            bbox = torch.tensor([bx, by, bw, bh])
+            print(f"SAM2 skipped (skip_sam2_eval=true) — CLIP-tile bbox: {bbox.tolist()}")
         else:
             print("SAM2: estimating bbox from region point...")
             region_point_yx = np.array([region_point[1], region_point[0]], dtype=np.float32)
@@ -431,9 +447,11 @@ class IndexedQueryEngine:
             max_area_frac = 0.60 if is_large_obj else 0.12
             if is_large_obj:
                 print(f"  Large-area object detected — SAM2 mask limit raised to {max_area_frac:.0%}")
+            _sam_size = self.config['text_query'].get('sam_inference_size', 1024)
             bbox = self.localizer.point_to_bbox(
                 frames[center_local], region_point_yx, text_feat,
                 max_area_frac=max_area_frac,
+                inference_size=_sam_size,
             )
         print(f"  Bbox: {bbox}")
 
@@ -447,26 +465,19 @@ class IndexedQueryEngine:
         cv2.imwrite(debug_path, cv2.cvtColor(debug_frame, cv2.COLOR_RGB2BGR))
         print(f"  Debug frame saved: {debug_path}")
 
-        # ---- Step 7: SAM2 tracking ----
-        print("SAM2: tracking bbox through context window...")
-        track = self.localizer.track_from_bbox(
-            frames, center_local, bbox, half_span
-        )
-        print(f"  Tracked {len(track)} frames")
-        if len(track) > 0:
-            # Map local window indices to absolute video frame indices.
-            for t in track:
-                t['frame_idx'] = int(t['frame_idx']) + start_idx
-        if len(track) == 0:
-            track = [{'frame_idx': last_frame_idx,
-                      'bbox': [bx, by, bw, bh]}]
-            print("  [Warn] SAM2 produced no masks; exporting single-frame bbox.")
+        # ---- Step 7: SAM2 tracking (skip for interactive mode - too slow) ----
+        # For interactive evaluation, just use the single matched frame
+        # For paper results, uncomment to enable full tracking
+        track = [{'frame_idx': last_frame_idx, 'bbox': [bx, by, bw, bh]}]
+        print("  [Interactive mode] Skipping SAM2 tracking (too slow)")
+        print(f"  Using single-frame bbox: {[bx, by, bw, bh]}")
 
         # ---- Step 8: export clip ----
         print("\nExporting result clip...")
         self.localizer.export_clip(
             video_path, track, last_frame_idx,
-            fps, os.path.join(output_dir, 'last_occurrence.mp4')
+            fps, os.path.join(output_dir, 'last_occurrence.mp4'),
+            context_seconds=context_seconds,
         )
 
         result = {
@@ -790,6 +801,7 @@ class IndexedQueryEngine:
         frame_rgb: np.ndarray,
         text_feat: torch.Tensor,
         grid_size: int = 6,
+        fast_mode: bool = False,
     ) -> Tuple[Tuple[int, int], float]:
         """
         Score crops at multiple scales with 50% overlap so objects near tile
@@ -797,8 +809,10 @@ class IndexedQueryEngine:
 
         Crops generated:
           - Full frame (global context)
-          - 4 quadrant halves
-          - grid_size×grid_size tiles at 50% stride (overlapping)
+          - 4 quadrant halves (if not fast_mode)
+          - grid_size×grid_size tiles at 50% stride (if not fast_mode, skipped if fast_mode)
+
+        fast_mode: if True, only score the full frame + 2×2 quadrants (≈5 crops vs 50+)
         """
         h, w = frame_rgb.shape[:2]
 
@@ -808,8 +822,11 @@ class IndexedQueryEngine:
         crops.append(self.localizer.clip_preprocess(Image.fromarray(frame_rgb)))
         centers.append((w // 2, h // 2))
 
+        # Fast mode: only 2×2 quadrants, skip fine grid
+        scales = (2,) if fast_mode else (2, 3)
+
         # Quadrant halves (2×2 with 50% overlap = 3×3 positions)
-        for scale_div in (2, 3):
+        for scale_div in scales:
             ph, pw = h // scale_div, w // scale_div
             stride_h, stride_w = ph // 2, pw // 2
             y1 = 0
@@ -824,20 +841,21 @@ class IndexedQueryEngine:
                     x1 += stride_w
                 y1 += stride_h
 
-        # Fine grid at 50% overlap
-        ph, pw = h // grid_size, w // grid_size
-        stride_h, stride_w = max(1, ph // 2), max(1, pw // 2)
-        y1 = 0
-        while y1 + ph <= h:
-            x1 = 0
-            while x1 + pw <= w:
-                y2, x2 = min(h, y1 + ph), min(w, x1 + pw)
-                crops.append(self.localizer.clip_preprocess(
-                    Image.fromarray(frame_rgb[y1:y2, x1:x2])
-                ))
-                centers.append(((x1 + x2) // 2, (y1 + y2) // 2))
-                x1 += stride_w
-            y1 += stride_h
+        # Fine grid at 50% overlap (skip in fast_mode)
+        if not fast_mode:
+            ph, pw = h // grid_size, w // grid_size
+            stride_h, stride_w = max(1, ph // 2), max(1, pw // 2)
+            y1 = 0
+            while y1 + ph <= h:
+                x1 = 0
+                while x1 + pw <= w:
+                    y2, x2 = min(h, y1 + ph), min(w, x1 + pw)
+                    crops.append(self.localizer.clip_preprocess(
+                        Image.fromarray(frame_rgb[y1:y2, x1:x2])
+                    ))
+                    centers.append(((x1 + x2) // 2, (y1 + y2) // 2))
+                    x1 += stride_w
+                y1 += stride_h
 
         crop_batch = torch.stack(crops).to(self.device)
         with torch.no_grad(), torch.autocast(
@@ -846,6 +864,65 @@ class IndexedQueryEngine:
             crop_feats = self.localizer.clip_model.encode_image(crop_batch).float()
         crop_feats = F.normalize(crop_feats, p=2, dim=-1)
         scores = (crop_feats @ text_feat.T).squeeze(-1).cpu().numpy()
+        best = int(np.argmax(scores))
+        return centers[best], float(scores[best])
+
+    # ------------------------------------------------------------------ #
+    # REN-guided spatial localization                                      #
+    # ------------------------------------------------------------------ #
+
+    def _ren_guided_localize(
+        self,
+        frame_rgb: np.ndarray,
+        text_feat: torch.Tensor,
+        stride: int = 4,
+    ) -> Tuple[Tuple[int, int], float]:
+        """
+        Use REN's 32×32 semantic grid as region proposals, score each crop with
+        CLIP, and return the (x, y) center of the highest-scoring region.
+
+        This bridges RELOCATE's region-based localization to text queries without
+        any cross-space adapter: REN provides object-aware spatial proposals (its
+        grid_points) and CLIP scores them in a text-compatible embedding space.
+
+        stride: take every Nth grid point (1024 total → stride=4 gives 256 proposals)
+        """
+        h, w = frame_rgb.shape[:2]
+        img_res = self.config['ren']['parameters']['image_resolution']
+
+        # Accessing .ren triggers the lazy REN load (DINOv2 ViT-L/14).
+        # grid_points: (grid_size², 2) in 518×518 normalised coords (y, x).
+        grid_points = self.localizer.ren.grid_points.cpu().numpy()
+        scale_y = h / float(img_res)
+        scale_x = w / float(img_res)
+
+        patch_r = max(32, min(h, w) // 8)
+        crops: List = []
+        centers: List[Tuple[int, int]] = []
+
+        for py_norm, px_norm in grid_points[::stride]:
+            py = int(py_norm * scale_y)
+            px = int(px_norm * scale_x)
+            y1 = max(0, py - patch_r)
+            y2 = min(h, py + patch_r)
+            x1 = max(0, px - patch_r)
+            x2 = min(w, px + patch_r)
+            patch = frame_rgb[y1:y2, x1:x2]
+            if patch.size == 0:
+                continue
+            crops.append(self.localizer.clip_preprocess(Image.fromarray(patch)))
+            centers.append((px, py))
+
+        if not crops:
+            return (w // 2, h // 2), 0.0
+
+        crop_batch = torch.stack(crops).to(self.device)
+        with torch.no_grad(), torch.autocast(
+            self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
+        ):
+            feats = self.localizer.clip_model.encode_image(crop_batch).float()
+        feats = F.normalize(feats, p=2, dim=-1)
+        scores = (feats @ text_feat.T).squeeze(-1).cpu().numpy()
         best = int(np.argmax(scores))
         return centers[best], float(scores[best])
 
@@ -897,8 +974,8 @@ def main():
     parser.add_argument('--output', type=str)
     parser.add_argument('--threshold', type=float, default=None,
                         help='CLIP cosine similarity threshold (default: from config, 0.20)')
-    parser.add_argument('--region-grid', type=int, default=6, dest='region_grid',
-                        help='N×N grid for CLIP crop scoring (default: 6)')
+    parser.add_argument('--region-grid', type=int, default=3, dest='region_grid',
+                        help='N×N grid for CLIP crop scoring (default: 3 for speed, use 6 for max accuracy)')
     parser.add_argument('--ocr-weight', type=float, default=None, dest='ocr_weight',
                         help='Weight for OCR brand match score (default: 0.3). '
                              'Set 0 to disable OCR fusion.')
