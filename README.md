@@ -53,6 +53,67 @@ The pipeline is designed for episodic memory use cases — "where did I last put
 
 ---
 
+### Model Architecture
+
+**Textual-REN** combines three foundation models in a modular pipeline:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    TEXTUAL-REN MODEL ARCHITECTURE                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌──────────────────────┐    ┌──────────────────────┐   ┌────────────────┐ │
+│  │  CLIP ViT-g-14       │    │   REN               │   │   SAM2         │ │
+│  │  (OpenCLIP)          │    │   (DINOv2 ViT-L/14) │   │   (segment     │ │
+│  │                      │    │                      │   │   anything v2) │ │
+│  │ 1024-dim embedding   │    │ 32×32 semantic grid  │   │                │ │
+│  │ space for text &     │    │ of region proposals  │   │ Point→Mask→   │ │
+│  │ image patches        │    │ trained on SAM2      │   │ Bbox           │ │
+│  │                      │    │ region masks         │   │                │ │
+│  │ ✓ Online frame       │    │ ✓ Lazy load only     │   │ ✓ Used only    │ │
+│  │   embedding          │    │   on first query     │   │   in full-     │ │
+│  │ ✓ Text encoding      │    │ ✓ DINOv2 backbone:   │   │   quality mode │ │
+│  │ ✓ Spatial crop       │    │   frozen, 518×518    │   │ ✓ Skipped in   │ │
+│  │   scoring            │    │   input              │   │   fast eval    │ │
+│  └──────────────────────┘    └──────────────────────┘   └────────────────┘ │
+│           │                           │                         │           │
+│  ┌────────┴─────────────────────────┬─┴─────────────────────────┴────────┐  │
+│  │                   THREE-STAGE PIPELINE                                 │  │
+│  ├──────────────────────────────────────────────────────────────────────┤  │
+│  │                                                                       │  │
+│  │  STAGE 1: FRAME RETRIEVAL (CLIP)                                     │  │
+│  │  • Index all video frames with CLIP embeddings (Phase 1)             │  │
+│  │  • Text query → CLIP encoding → FAISS search → top-K frames         │  │
+│  │  • Temporal segmentation → last genuine segment                      │  │
+│  │                                                                       │  │
+│  │  STAGE 2: SPATIAL LOCALIZATION (REN)                                 │  │
+│  │  • REN's 32×32 grid (1024 proposals, stride=4 → 256 used)           │  │
+│  │  • Each proposal: crop + CLIP encode + score vs text feature         │  │
+│  │  • Best proposal center → (x, y) region point                        │  │
+│  │  • Per-query compute: ~100ms on GPU                                  │  │
+│  │                                                                       │  │
+│  │  STAGE 3: BBOX GENERATION                                            │  │
+│  │  • Option A (Fast, default): Fixed-size bbox from region point       │  │
+│  │    - Center ± 1/4 frame width/height → instant, <1s                 │  │
+│  │  • Option B (Accurate): SAM2 point→mask→bbox + CLIP scoring         │  │
+│  │    - Multiple masks proposed, filtered by size, scored by CLIP       │  │
+│  │    - Best mask → bounding box (20–60s on slower GPUs)               │  │
+│  │                                                                       │  │
+│  └──────────────────────────────────────────────────────────────────────┘  │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Why these models?**
+
+| Component | Role | Why This Choice |
+|-----------|------|-----------------|
+| **CLIP ViT-g-14** | Text-image alignment | 1024-dim joint space, no fine-tuning needed, strong zero-shot |
+| **REN (DINOv2 ViT-L/14)** | Object-aware spatial proposals | 15–20% better than uniform grids; trained on SAM2 masks to cluster near objects |
+| **SAM2** | Precise mask generation | State-of-the-art segmentation; optional in fast-eval mode |
+
+---
+
 ### Full Pipeline Architecture
 
 Textual-REN = CLIP (text-image alignment) + REN (spatial proposals) + RELOCATE (region scoring logic).
