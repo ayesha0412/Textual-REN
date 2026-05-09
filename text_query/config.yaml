@@ -4,7 +4,7 @@ data:
 text_query:
   similarity_threshold: 0.18   # CLIP cosine similarity cutoff for candidate frames
   use_compositional: false      # disable query decomposition (future work)
-  context_seconds: 5.0          # clip length around last occurrence (±N seconds)
+  context_seconds: 0.5          # ±N/2 seconds temporal window for Stage 4 (was 5.0 for export)
   frame_sample_rate: 10         # process every Nth frame for CLIP retrieval (1 = all)
   ocr_weight: 0.3               # weight for OCR brand match in fused score (0 = disabled)
   min_crop_verify: 0.17         # min CLIP crop score to accept a candidate frame as valid
@@ -16,6 +16,16 @@ text_query:
   tracker_param: 'configs/sam2.1/sam2.1_hiera_l.yaml'
   patch_size: 8                 # feature patch size for SAM-pooled tokens (DINO)
   save_dir: 'logs/'
+
+  # RELOCATE Stage 3: Selection Policy
+  selection_policy: "last"      # "last", "strongest", "topk", "topp"
+  selection_top_k: 10           # For topk/topp mode
+  selection_top_p: 0.9          # Nucleus sampling threshold
+  nms_threshold: 0.5            # Inter-frame NMS: suppress within 0.5s
+  nms_window: null              # Or: group frames in windows (null = threshold-based NMS)
+
+  # RELOCATE Stage 5: Multi-Candidate Refinement
+  max_candidates_to_refine: 5   # Beam search width for REN refinement
 
   # Keep SAM semantics, but reduce the compute cost during evaluation
   sam_inference_size: 512       # 1024 = full quality, 768/512 = faster with similar masks
@@ -72,6 +82,13 @@ ren:
     upsample_features: False
     deduplicate_masks: False
     num_workers: 16
+    # REN-specific parameters
+    feature_extractor: 'dinov2_vitl14'  # Feature extraction model
+    grid_size: 32                       # REN grid size (32x32 = 1024 proposals)
+    use_slic: False                     # Use SLIC superpixels or grid
+    aggregate_tokens: False             # Aggregate REN tokens
+    token_variant: 'default'            # Token variant
+    ren_ckpt: './logs/ren-dinov2-vitl14/checkpoint.pth'  # Path to REN checkpoint
 
   logging:
     save_dir: '../logs/'

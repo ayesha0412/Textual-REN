@@ -62,6 +62,269 @@ except ImportError:
 from localizer import TextQueryLocalizer
 
 
+# ====================================================================== #
+# STAGE 3: SELECTION POLICY                                              #
+# ====================================================================== #
+# Adapted from visual_query/models.py CandidateSelector                   #
+
+class SelectionPolicy:
+    """RELOCATE Stage 3: Select candidates using temporal segmentation + ranking."""
+
+    def __init__(self, config: Dict):
+        self.config = config
+        self.policy_name = config.get('text_query', {}).get('selection_policy', 'last')
+        self.top_k = config.get('text_query', {}).get('selection_top_k', 10)
+        self.top_p = config.get('text_query', {}).get('selection_top_p', 0.9)
+        self.nms_threshold = config.get('text_query', {}).get('nms_threshold', 0.5)
+        self.nms_window = config.get('text_query', {}).get('nms_window', None)
+
+    def temporal_segmentation(self, all_sims, frame_metadata, fps, sample_rate, threshold=0.18):
+        """
+        Group above-threshold frames into contiguous temporal segments.
+        Returns: list of segments, each segment = set of metadata indices
+        """
+        # Find frames above threshold
+        above_threshold = {i for i, sim in enumerate(all_sims) if sim >= threshold}
+        if not above_threshold:
+            return [], []
+
+        # Group into contiguous segments (gap tolerance: 2 seconds)
+        gap_tolerance_frames = max(1, int(2.0 * fps / sample_rate)) * sample_rate
+        sorted_indices = sorted(above_threshold)
+
+        segments = []
+        current_segment = {sorted_indices[0]}
+
+        for i in range(1, len(sorted_indices)):
+            frame_idx_curr = frame_metadata[sorted_indices[i]]['frame_idx']
+            frame_idx_prev = frame_metadata[sorted_indices[i-1]]['frame_idx']
+
+            if frame_idx_curr - frame_idx_prev <= gap_tolerance_frames:
+                current_segment.add(sorted_indices[i])
+            else:
+                segments.append(current_segment)
+                current_segment = {sorted_indices[i]}
+
+        if current_segment:
+            segments.append(current_segment)
+
+        # Filter: keep segments with ≥2 frames (suppress single-frame spikes)
+        valid_segments = [s for s in segments if len(s) >= 2]
+
+        return valid_segments, sorted_indices
+
+    def inter_frame_nms(self, all_sims, frame_metadata, fps, sample_rate,
+                        nms_threshold=0.5, nms_window=None):
+        """
+        Suppress temporally nearby detections (NMS or windowing).
+        """
+        if nms_window is not None:
+            # Window-based: group frames, pick max per window
+            window_size = int(nms_window * fps / sample_rate)
+            selected = []
+            for i in range(0, len(all_sims), window_size):
+                window = range(i, min(i + window_size, len(all_sims)))
+                if window:
+                    best_idx = max(window, key=lambda j: all_sims[j])
+                    selected.append(best_idx)
+            return selected
+        else:
+            # Threshold-based NMS: suppress within nms_threshold seconds
+            nms_frames = int(nms_threshold * fps / sample_rate)
+            selected = []
+            sorted_idx = sorted(range(len(all_sims)), key=lambda i: all_sims[i], reverse=True)
+            suppressed = set()
+
+            for idx in sorted_idx:
+                if idx in suppressed:
+                    continue
+                selected.append(idx)
+                frame_idx = frame_metadata[idx]['frame_idx']
+                # Suppress nearby frames
+                for other_idx in range(len(all_sims)):
+                    if abs(frame_metadata[other_idx]['frame_idx'] - frame_idx) <= nms_frames:
+                        suppressed.add(other_idx)
+
+            return sorted(selected)
+
+    def topk_selection(self, candidates, top_k):
+        """Select top-K candidates by similarity score."""
+        if len(candidates) <= top_k:
+            return candidates
+        sorted_cands = sorted(candidates, key=lambda x: x['similarity'], reverse=True)
+        return sorted_cands[:top_k]
+
+    def topp_selection(self, candidates, top_p):
+        """Nucleus sampling: select candidates until cumulative prob ≥ top_p."""
+        if not candidates:
+            return []
+
+        sims = np.array([c['similarity'] for c in candidates])
+        sims_normalized = sims / (sims.sum() + 1e-10)
+
+        sorted_idx = np.argsort(-sims)
+        cumsum = 0.0
+        selected_idx = []
+
+        for idx in sorted_idx:
+            cumsum += sims_normalized[idx]
+            selected_idx.append(idx)
+            if cumsum >= top_p:
+                break
+
+        return [candidates[i] for i in selected_idx]
+
+    def select(self, all_sims, frame_metadata, fps, sample_rate, threshold=0.18):
+        """
+        RELOCATE Stage 3: Temporal segmentation + deterministic/probabilistic selection.
+
+        Returns: (candidates, num_valid_segments)
+            candidates: list of candidate dicts: [{'frame_idx': idx, 'similarity': sim}, ...]
+            num_valid_segments: number of valid temporal segments found
+        """
+        # Temporal segmentation
+        valid_segments, _ = self.temporal_segmentation(all_sims, frame_metadata, fps, sample_rate, threshold)
+        num_valid = len(valid_segments)
+
+        if not valid_segments:
+            # Fallback: use frame with highest similarity
+            best_idx = np.argmax(all_sims)
+            return [{'frame_idx': frame_metadata[best_idx]['frame_idx'], 'similarity': float(all_sims[best_idx])}], 0
+
+        # Build candidate list from segments (peak frame per segment)
+        candidates = []
+        for segment in valid_segments:
+            peak_idx = max(segment, key=lambda i: all_sims[i])
+            candidates.append({
+                'frame_idx': frame_metadata[peak_idx]['frame_idx'],
+                'meta_idx': peak_idx,
+                'similarity': float(all_sims[peak_idx]),
+                'segment': segment
+            })
+
+        # Rank candidates (last segment first for temporal preference)
+        candidates = sorted(candidates, key=lambda x: -x['meta_idx'])  # Recent first
+
+        # Apply selection policy
+        if self.policy_name == 'last':
+            result = candidates[:1]  # Just the last segment's peak
+        elif self.policy_name == 'strongest':
+            best = max(candidates, key=lambda x: x['similarity'])
+            result = [best]
+        elif self.policy_name == 'topk':
+            result = self.topk_selection(candidates, self.top_k)
+        elif self.policy_name == 'topp':
+            result = self.topp_selection(candidates, self.top_p)
+        else:
+            result = candidates[:1]  # Default to last
+
+        return result, num_valid
+
+
+# ====================================================================== #
+# STAGE 5: CANDIDATE REFINER (Multi-candidate REN refinement)             #
+# ====================================================================== #
+# Adapted from visual_query/models.py CandidateRefiner                    #
+
+class CandidateRefiner:
+    """RELOCATE Stage 5: Refine multiple candidates with REN + SAM2."""
+
+    def __init__(self, query_engine, config: Dict):
+        self.query_engine = query_engine
+        self.config = config
+        self.max_candidates = config.get('text_query', {}).get('max_candidates_to_refine', 5)
+        self.skip_sam2 = config.get('text_query', {}).get('skip_sam2_eval', True)
+
+    def refine(self, selected_candidates, frames, frame_indices, text_feat):
+        """
+        Refine top-K candidates using REN-guided spatial localization + SAM2.
+
+        Input:
+            selected_candidates: list of {'frame_idx', 'similarity', ...}
+            frames: list of np.ndarray (loaded video frames)
+            frame_indices: list of int (frame indices for each frame)
+            text_feat: torch.Tensor (1, 1024) - CLIP text embedding
+
+        Output:
+            list of refined candidates sorted by refined_score
+        """
+        refined = []
+        h, w = frames[0].shape[:2] if frames else (0, 0)
+
+        # Try to use REN; fall back to CLIP-tile if REN fails
+        use_ren = True
+        try:
+            _ = self.query_engine.localizer.ren  # Try to load REN
+        except SystemExit:
+            print("  REN checkpoint failed to load; falling back to CLIP-tile path")
+            use_ren = False
+        except Exception as e:
+            print(f"  REN loading failed ({e}); falling back to CLIP-tile path")
+            use_ren = False
+
+        for cand in selected_candidates[:self.max_candidates]:
+            frame_idx = cand['frame_idx']
+
+            # Find frame in temporal window
+            try:
+                local_idx = frame_indices.index(frame_idx)
+                frame_rgb = frames[local_idx]
+            except (ValueError, IndexError):
+                print(f"  Warning: frame {frame_idx} not in context window, skipping")
+                continue
+
+            # Stage 5a: REN-guided spatial localization (with fallback)
+            if use_ren:
+                try:
+                    region_point, region_score = self.query_engine._ren_guided_localize(frame_rgb, text_feat)
+                except Exception as e:
+                    print(f"  REN localization failed for frame {frame_idx}: {e}, using CLIP-tile fallback")
+                    region_point = (w // 2, h // 2)
+                    region_score = 0.0
+            else:
+                # CLIP-tile fallback: use frame center
+                region_point = (w // 2, h // 2)
+                region_score = 0.0
+
+            # Stage 5b: SAM2 point → bbox
+            if self.skip_sam2:
+                # CLIP-tile fast path
+                bbox_width = max(64, w // 4)
+                bbox_height = max(64, h // 4)
+                x_min = max(0, region_point[0] - bbox_width // 2)
+                y_min = max(0, region_point[1] - bbox_height // 2)
+                bbox = [x_min, y_min, bbox_width, bbox_height]
+            else:
+                # SAM2 accurate path
+                try:
+                    bbox_tensor = self.query_engine.localizer.point_to_bbox(
+                        frame_rgb,
+                        np.array([region_point[1], region_point[0]]),  # SAM2 uses (y, x)
+                        text_feat,
+                        inference_size=self.config.get('text_query', {}).get('sam_inference_size', 512)
+                    )
+                    bbox = bbox_tensor.tolist()
+                except Exception as e:
+                    print(f"  SAM2 failed for frame {frame_idx}: {e}, using fast path")
+                    bbox_width = max(64, w // 4)
+                    bbox_height = max(64, h // 4)
+                    x_min = max(0, region_point[0] - bbox_width // 2)
+                    y_min = max(0, region_point[1] - bbox_height // 2)
+                    bbox = [x_min, y_min, bbox_width, bbox_height]
+
+            refined.append({
+                'frame_idx': frame_idx,
+                'region_point': region_point,
+                'region_score': region_score,
+                'bbox': bbox,
+                'refined_score': region_score
+            })
+
+        # Sort by refined score (descending)
+        refined.sort(key=lambda x: x['refined_score'], reverse=True)
+        return refined
+
+
 class IndexedQueryEngine:
     """Query against a FAISS-indexed video using CLIP text-image retrieval."""
 
@@ -243,219 +506,103 @@ class IndexedQueryEngine:
                 f"No frames found above similarity threshold {threshold}"
             )
 
-        # ---- Step 3: temporal segmentation → last genuine segment ----
-        # Sort above-threshold frame indices by video time.
-        above = np.where(all_sims >= threshold)[0]
-        sorted_above = sorted(above.tolist(),
-                              key=lambda i: frame_metadata[i]['frame_idx'])
-
-        # Two consecutive sampled frames belong to the same segment when the gap
-        # between their video frame indices is ≤ gap_frames.
-        # At 60 fps / sample_rate=10, 2 seconds = 12 sampled frames gap.
-        gap_frames = max(1, int(2.0 * fps / sample_rate)) * sample_rate
-
-        segments: List[List[int]] = []
-        current: List[int] = [sorted_above[0]]
-        for idx in sorted_above[1:]:
-            prev_vidx = frame_metadata[current[-1]]['frame_idx']
-            curr_vidx = frame_metadata[idx]['frame_idx']
-            if curr_vidx - prev_vidx > gap_frames:
-                segments.append(current)
-                current = [idx]
-            else:
-                current.append(idx)
-        segments.append(current)
-
-        # Filter to segments with ≥ 2 sampled frames (suppresses single-frame spikes).
-        valid = [s for s in segments if len(s) >= 2]
-        if not valid:
-            valid = segments   # fallback: accept singletons if nothing else
-
-        print(f"  {len(segments)} segment(s) found, {len(valid)} valid (≥2 frames):")
-        for s in valid[-5:]:
-            pk = max(s, key=lambda i: all_sims[i])
-            t0 = frame_metadata[s[0]]['frame_idx'] / fps
-            t1 = frame_metadata[s[-1]]['frame_idx'] / fps
-            print(f"    t={t0:.1f}–{t1:.1f}s  n={len(s)}  peak_sim={all_sims[pk]:.3f}")
-
-        # Identify global peak segment (used by ablation_use_strongest mode).
-        segment_peaks = [(max(s, key=lambda i: all_sims[i]), s) for s in valid]
-        global_peak_idx, global_peak_segment = max(
-            segment_peaks, key=lambda t: all_sims[t[0]]
+        # ========================================================================= #
+        # RELOCATE STAGE 3: Selection Policy (temporal segmentation + ranking)    #
+        # ========================================================================= #
+        selection_policy = SelectionPolicy(self.config)
+        selected_candidates, num_valid_segments = selection_policy.select(
+            all_sims, frame_metadata, fps, sample_rate, threshold=threshold
         )
-        global_peak_sim = float(all_sims[global_peak_idx])
 
-        if ablation_use_strongest:
-            # Ablation: bypass temporal logic, use the globally strongest segment.
-            last_segment = global_peak_segment
-            last_meta_idx = global_peak_idx
-        else:
-            # Default: prefer the LAST (most recent) segment.
-            # Step 3b crop-verification below will refine this choice — if the
-            # last segment clearly doesn't contain the object an earlier segment
-            # with a better crop score will be accepted instead.
-            last_segment = valid[-1]
-            last_meta_idx = max(last_segment, key=lambda i: all_sims[i])
+        print(f"  {num_valid_segments} segment(s) found, {len(selected_candidates)} candidate(s) selected (policy={selection_policy.policy_name})")
 
-        last_frame_idx = frame_metadata[last_meta_idx]['frame_idx']
-        last_sim = float(all_sims[last_meta_idx])
+        # For backwards-compatibility with ablations, pick the first/best candidate
+        best_candidate = selected_candidates[0]
+        last_frame_idx = best_candidate['frame_idx']
+        last_sim = best_candidate['similarity']
+        last_meta_idx = best_candidate.get('meta_idx', None)
 
-        if not ablation_use_strongest:
-            min_peak = self.config['text_query'].get('last_segment_min_peak', threshold)
-            min_rel  = self.config['text_query'].get('last_segment_min_rel', 0.0)
-            if last_sim < min_peak or last_sim < min_rel * global_peak_sim:
-                # Last segment is genuinely weak — fall back to the strongest.
-                last_meta_idx  = global_peak_idx
-                last_segment   = global_peak_segment
-                last_frame_idx = frame_metadata[last_meta_idx]['frame_idx']
-                last_sim       = global_peak_sim
-                print(f"\n  Last segment weak (peak={last_sim:.3f} vs min_peak={min_peak}, "
-                      f"global={global_peak_sim:.3f}) — falling back to strongest segment")
-
-        # ---- Step 3b: verify the chosen frame (fast: use FAISS similarity, skip crop scoring) ----
-        crop_score = 0.0
-        MIN_CROP_VERIFY = self.config['text_query'].get('min_crop_verify', 0.17)
-        if ablation_no_verification:
-            MIN_CROP_VERIFY = 0.0   # always accept first candidate
-
-        # Walk from the latest segment backward.  If a segment passes the similarity
-        # threshold we accept it immediately (it is the last good occurrence).
-        # If *no* segment passes we fall back to the latest segment.
-        # NOTE: Skip expensive crop verification — use FAISS similarity score directly.
-        last_seg_fallback = None   # (segment, meta_idx, frame_idx, sim, frame_rgb)
-
-        for attempt in range(len(valid) - 1, -1, -1):
-            cand_segment = valid[attempt]
-            cand_meta_idx = max(cand_segment, key=lambda i: all_sims[i])
-            cand_frame_idx = frame_metadata[cand_meta_idx]['frame_idx']
-            cand_sim = float(all_sims[cand_meta_idx])
-            cand_frame_rgb = self._load_single_frame(video_path, cand_frame_idx)
-            t = cand_frame_idx / fps
-            print(f"  Verify segment {attempt+1}/{len(valid)}: "
-                  f"frame {cand_frame_idx} (t={t:.1f}s) sim={cand_sim:.3f}", end='')
-
-            # Remember the last (most recent) segment as our ultimate fallback.
-            if last_seg_fallback is None:
-                last_seg_fallback = (cand_segment, cand_meta_idx, cand_frame_idx,
-                                     cand_sim, cand_frame_rgb)
-
-            if cand_sim >= MIN_CROP_VERIFY:
-                last_segment = cand_segment
-                last_meta_idx = cand_meta_idx
-                last_frame_idx = cand_frame_idx
-                last_sim = cand_sim
-                last_frame_rgb = cand_frame_rgb
-                crop_score = cand_sim
-                print(f"  ✓ accepted")
-                break
-            print(f"  ✗ too low — trying previous segment")
-        else:
-            # No segment passed verification — use the LAST (most recent) segment.
-            (last_segment, last_meta_idx, last_frame_idx,
-             last_sim, last_frame_rgb) = last_seg_fallback
-            crop_score = last_sim
-            print(f"\n  No segment passed similarity verify — defaulting to last occurrence "
-                  f"(t={last_frame_idx/fps:.1f}s, sim={crop_score:.3f})")
-
-        print(f"\n  Last occurrence → frame {last_frame_idx}  "
-              f"(t={last_frame_idx/fps:.2f}s, sim={last_sim:.3f}, crop={crop_score:.3f})")
-
-        # ---- Step 4: spatial localization on the last-occurrence frame ----
-
-        ocr_bbox_result = None
-        ocr_bbox_frame_idx = None
-        last_ocr_score = float(ocr_scores[last_meta_idx])
-
-        # When this is a brand query with high OCR confidence, read the bbox
-        # directly from the frame rather than relying on SAM2 mask selection.
-        if is_brand and last_ocr_score >= 0.85 and HAS_EASYOCR:
-            print(f"\nOCR score high ({last_ocr_score:.2f}) — locating brand bbox...")
-            # Build candidate frame indices: last-occurrence first, then neighbors
-            # sorted by their OCR score descending so we try the clearest frame first.
-            segment_indices = sorted(
-                last_segment,
-                key=lambda i: ocr_scores[i],
-                reverse=True,
-            )[:6]
-            for cand_meta_idx in segment_indices:
-                cand_frame_idx = frame_metadata[cand_meta_idx]['frame_idx']
-                cand_frame_rgb = self._load_single_frame(video_path, cand_frame_idx)
-                ocr_bbox_result = self._get_ocr_bbox(cand_frame_rgb, text_query)
-                if ocr_bbox_result is not None:
-                    ocr_bbox_frame_idx = cand_frame_idx
-                    print(f"  OCR bbox found on frame {cand_frame_idx} "
-                          f"(t={cand_frame_idx/fps:.1f}s)")
+        # Find the meta_idx if not provided (lookup in frame_metadata)
+        if last_meta_idx is None:
+            for i, fm in enumerate(frame_metadata):
+                if fm['frame_idx'] == last_frame_idx:
+                    last_meta_idx = i
                     break
-            if ocr_bbox_result is None:
-                print("  OCR bbox not found on any nearby frame — falling back to CLIP")
 
-        if ocr_bbox_result is not None:
-            region_point, ocr_bbox_xywh = ocr_bbox_result
-            region_score = last_ocr_score
-            if ocr_bbox_frame_idx != last_frame_idx:
-                print("  OCR bbox came from a nearby frame — using its center as SAM2 point")
-                ocr_bbox_xywh = None
-            print(f"  Spatial location (OCR): {region_point}")
-        else:
-            # REN-guided spatial localization: use REN's 32×32 semantic grid as
-            # region proposals, score each with CLIP (same embedding space as text).
-            # This is the RELOCATE region-search step adapted for text queries.
-            (ren_cx, ren_cy), region_score = self._ren_guided_localize(
-                last_frame_rgb, text_feat
-            )
-            region_point = (ren_cx, ren_cy)
-            print(f"  Spatial location (REN-guided): {region_point}  score={region_score:.3f}")
-            ocr_bbox_xywh = None
+        print(f"\n  Best candidate → frame {last_frame_idx}  "
+              f"(t={last_frame_idx/fps:.2f}s, sim={last_sim:.3f})")
 
-        # ---- Step 5: context window centred on the last-occurrence frame ----
-        # For interactive eval: minimal window (0.5s) since we skip tracking
-        context_seconds = 0.5  # Skip expensive tracking
+        # ========================================================================= #
+        # STAGE 4: Temporal Sampling (extract ±context window for refinement)      #
+        # ========================================================================= #
+        context_seconds = self.config['text_query'].get('context_seconds', 0.5)
         half_span = int(context_seconds * fps / 2)
-
         print(f"\nLoading ±{context_seconds/2:.1f}s context window...")
         frames, frame_indices = self._load_frame_window(
             video_path, last_frame_idx, half_span
         )
-        start_idx = max(0, last_frame_idx - half_span)
-        center_local = last_frame_idx - start_idx   # may be < half_span near video edges
+        center_local = frame_indices.index(last_frame_idx) if last_frame_idx in frame_indices else 0
 
-        # ---- Step 6: bbox — OCR direct, CLIP-tile fast path, or SAM2 ----
-        _skip_sam2 = self.config['text_query'].get('skip_sam2_eval', False)
+        # ========================================================================= #
+        # STAGE 5: Multi-Candidate REN Refinement (spatial localization)           #
+        # ========================================================================= #
+        refiner = CandidateRefiner(self, self.config)
+        refined_candidates = refiner.refine(selected_candidates, frames, frame_indices, text_feat)
 
+        if refined_candidates:
+            best_refined = refined_candidates[0]
+            region_point = tuple(best_refined['region_point'])
+            region_score = best_refined['region_score']
+            bbox_from_refiner = best_refined['bbox']
+        else:
+            print("  [Warning] REN refinement failed, using CLIP-tile fallback")
+            # Fallback: simple CLIP-tile bbox around best candidate
+            if frames:
+                fh, fw = frames[center_local].shape[:2]
+                region_point = (fw // 2, fh // 2)  # frame center
+                region_score = 0.0
+                bbox_width = max(64, fw // 4)
+                bbox_height = max(64, fh // 4)
+                bbox_from_refiner = [max(0, fw//2 - bbox_width//2), max(0, fh//2 - bbox_height//2),
+                                     bbox_width, bbox_height]
+            else:
+                raise RuntimeError("No frames loaded in temporal window")
+
+        print(f"  Spatial location (REN-guided): {region_point}  score={region_score:.3f}")
+
+        # ---- Stage 5b: bbox generation (OCR direct, CLIP-tile fast path, or SAM2) ----
+        _skip_sam2 = self.config['text_query'].get('skip_sam2_eval', True)
+
+        # Check for OCR brand match on the best refined candidate
+        ocr_bbox_xywh = None
+        last_ocr_score = float(ocr_scores[last_meta_idx]) if last_meta_idx < len(ocr_scores) else 0.0
+
+        if is_brand and last_ocr_score >= 0.85 and HAS_EASYOCR:
+            print(f"\nOCR score high ({last_ocr_score:.2f}) — locating brand bbox...")
+            # Try to get OCR bbox from the best frame
+            try:
+                frame_rgb = frames[center_local]
+                ocr_bbox_result = self._get_ocr_bbox(frame_rgb, text_query)
+                if ocr_bbox_result is not None:
+                    region_point, ocr_bbox_xywh = ocr_bbox_result
+                    print(f"  OCR bbox found: {ocr_bbox_xywh}")
+            except Exception as e:
+                print(f"  OCR bbox extraction failed: {e}")
+
+        # Use OCR bbox if available, otherwise use REN-refined bbox
         if ocr_bbox_xywh is not None:
             bbox = torch.tensor(ocr_bbox_xywh)
             print(f"SAM2 skipped — using OCR bbox: {bbox.tolist()}")
-        elif _skip_sam2:
-            # Fast path: derive bbox from the CLIP-best tile, no SAM2 needed.
-            # Tile size = 25 % of frame on each side → covers most kitchen objects.
-            fh, fw = frames[center_local].shape[:2]
-            cx, cy = region_point
-            bw = max(64, fw // 4)
-            bh = max(64, fh // 4)
-            bx = max(0, min(cx - bw // 2, fw - bw))
-            by = max(0, min(cy - bh // 2, fh - bh))
-            bbox = torch.tensor([bx, by, bw, bh])
-            print(f"SAM2 skipped (skip_sam2_eval=true) — CLIP-tile bbox: {bbox.tolist()}")
         else:
-            print("SAM2: estimating bbox from region point...")
-            region_point_yx = np.array([region_point[1], region_point[0]], dtype=np.float32)
-            # Large-area objects (paintings, screens, doors) need a higher mask
-            # area ceiling so SAM2 doesn't filter them out in favour of small
-            # foreground objects that happen to be in the same frame.
-            words_lower = set(text_query.lower().split())
-            is_large_obj = bool(words_lower & self._LARGE_OBJECT_WORDS)
-            max_area_frac = 0.60 if is_large_obj else 0.12
-            if is_large_obj:
-                print(f"  Large-area object detected — SAM2 mask limit raised to {max_area_frac:.0%}")
-            _sam_size = self.config['text_query'].get('sam_inference_size', 1024)
-            bbox = self.localizer.point_to_bbox(
-                frames[center_local], region_point_yx, text_feat,
-                max_area_frac=max_area_frac,
-                inference_size=_sam_size,
-            )
-        print(f"  Bbox: {bbox}")
+            bbox = torch.tensor(bbox_from_refiner, dtype=torch.int32)
+            if _skip_sam2:
+                print(f"SAM2 skipped (skip_sam2_eval=true) — REN-refined bbox: {bbox.tolist()}")
+            else:
+                print(f"SAM2 will refine REN bbox: {bbox.tolist()}")
 
-        # Save a debug image so you can verify the detected region visually
+        print(f"  Final Bbox: {bbox.tolist()}")
+
+        # Save a debug image
         debug_frame = frames[center_local].copy()
         px, py = int(region_point[0]), int(region_point[1])
         bx, by, bw, bh = [int(v) for v in bbox]
@@ -465,9 +612,7 @@ class IndexedQueryEngine:
         cv2.imwrite(debug_path, cv2.cvtColor(debug_frame, cv2.COLOR_RGB2BGR))
         print(f"  Debug frame saved: {debug_path}")
 
-        # ---- Step 7: SAM2 tracking (skip for interactive mode - too slow) ----
-        # For interactive evaluation, just use the single matched frame
-        # For paper results, uncomment to enable full tracking
+        # ---- Stage 6: SAM2 tracking (skip for interactive mode - too slow) ----
         track = [{'frame_idx': last_frame_idx, 'bbox': [bx, by, bw, bh]}]
         print("  [Interactive mode] Skipping SAM2 tracking (too slow)")
         print(f"  Using single-frame bbox: {[bx, by, bw, bh]}")
@@ -496,7 +641,7 @@ class IndexedQueryEngine:
             'region_point': list(region_point),
             'region_clip_score': round(region_score, 4),
             'similarity_threshold': threshold,
-            'valid_segments': len(valid),
+            'valid_segments': num_valid_segments,
             'frames_above_threshold': int(n_above),
             'context_seconds': context_seconds,
             'fps': fps,
