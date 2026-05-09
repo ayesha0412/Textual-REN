@@ -78,26 +78,44 @@ The pipeline is designed for episodic memory use cases — "where did I last put
 │  └──────────────────────┘    └──────────────────────┘   └────────────────┘ │
 │           │                           │                         │           │
 │  ┌────────┴─────────────────────────┬─┴─────────────────────────┴────────┐  │
-│  │                   THREE-STAGE PIPELINE                                 │  │
+│  │            RELOCATE 6-STAGE PIPELINE (Text Query Adaptation)           │  │
 │  ├──────────────────────────────────────────────────────────────────────┤  │
 │  │                                                                       │  │
-│  │  STAGE 1: FRAME RETRIEVAL (CLIP)                                     │  │
-│  │  • Index all video frames with CLIP embeddings (Phase 1)             │  │
-│  │  • Text query → CLIP encoding → FAISS search → top-K frames         │  │
-│  │  • Temporal segmentation → last genuine segment                      │  │
+│  │  STAGE 1: Frame Retrieval (CLIP) ✅                                   │  │
+│  │  • Text query → CLIP text encoder (ViT-g-14) → embedding             │  │
+│  │  • FAISS search: dot product against indexed frame embeddings        │  │
+│  │  • Returns: similarity scores for all frames                          │  │
 │  │                                                                       │  │
-│  │  STAGE 2: SPATIAL LOCALIZATION (REN)                                 │  │
-│  │  • REN's 32×32 grid (1024 proposals, stride=4 → 256 used)           │  │
-│  │  • Each proposal: crop + CLIP encode + score vs text feature         │  │
+│  │  STAGE 2: Cross-Modal Encoding ✅ (Implicit in CLIP space)           │  │
+│  │  • For text queries, CLIP's joint 1024-dim embedding space serves   │  │
+│  │    as the cross-modal bridge (no explicit encoder needed)            │  │
+│  │                                                                       │  │
+│  │  STAGE 3: Selection Policy ✅                                         │  │
+│  │  • Temporal Segmentation: group above-threshold frames (≥2 frames)   │  │
+│  │  • Deterministic modes: "last" (most recent) or "strongest"          │  │
+│  │  • Probabilistic modes: "topk" (top-K candidates) or "topp"          │  │
+│  │    (nucleus sampling) for multi-candidate refinement                 │  │
+│  │  • Returns: ranked list of candidate frames                          │  │
+│  │                                                                       │  │
+│  │  STAGE 4: Temporal Sampling ✅                                        │  │
+│  │  • Extract temporal context window: ±0.5 seconds around candidates   │  │
+│  │  • Load frame batch for Stage 5 refinement                           │  │
+│  │  • Ensures spatial locality for accurate region proposal scoring     │  │
+│  │                                                                       │  │
+│  │  STAGE 5: REN-Guided Refinement ✅                                    │  │
+│  │  • For top-K candidates (multi-candidate beam search):               │  │
+│  │    - REN's 32×32 semantic grid (1024 proposals, stride=4 used)      │  │
+│  │    - Crop each proposal, CLIP-encode, score vs text feature         │  │
 │  │  • Best proposal center → (x, y) region point                        │  │
-│  │  • Per-query compute: ~100ms on GPU                                  │  │
+│  │  • SAM2 point→mask→bbox (or CLIP-tile fast path)                    │  │
+│  │  • Returns: refined candidate with spatial location                  │  │
 │  │                                                                       │  │
-│  │  STAGE 3: BBOX GENERATION                                            │  │
-│  │  • Option A (Fast, default): Fixed-size bbox from region point       │  │
-│  │    - Center ± 1/4 frame width/height → instant, <1s                 │  │
-│  │  • Option B (Accurate): SAM2 point→mask→bbox + CLIP scoring         │  │
-│  │    - Multiple masks proposed, filtered by size, scored by CLIP       │  │
-│  │    - Best mask → bounding box (20–60s on slower GPUs)               │  │
+│  │  STAGE 6: Query Expansion via Memory ⏳                              │  │
+│  │  • (Future work) Iterative refinement with pseudo-labeled objects    │  │
+│  │  • Re-query with expanded candidate pool from SAM2 tracking         │  │
+│  │                                                                       │  │
+│  │  ⏱️  Total latency: ~2–5 seconds per query (CLIP-tile fast path)    │  │
+│  │      ~20–60 seconds (SAM2 full quality path)                         │  │
 │  │                                                                       │  │
 │  └──────────────────────────────────────────────────────────────────────┘  │
 │                                                                              │
@@ -116,12 +134,20 @@ The pipeline is designed for episodic memory use cases — "where did I last put
 
 ### Full Pipeline Architecture
 
-Textual-REN = CLIP (text-image alignment) + REN (spatial proposals) + RELOCATE (region scoring logic).
+**Textual-REN = CLIP (Stage 1) + Selection Policy (Stage 3) + REN (Stage 5) + RELOCATE (6-stage framework)**.
+
+The system implements all 6 stages of RELOCATE (Suris et al., ECCV 2024), adapted for free-text queries:
 
 **Phase 1 (Offline)**: Index video frames with CLIP embeddings + pre-computed OCR text.
-**Phase 2 (Online)**: Retrieve candidate frame (CLIP + temporal logic) → find object location (REN grid + CLIP crop scoring) → output bbox.
+**Phase 2 (Online)**: 6-stage pipeline:
+  1. CLIP text encoding → similarity scores (Stage 1)
+  2. Cross-modal scoring in CLIP's joint embedding space (Stage 2 — implicit)
+  3. Temporal segmentation + selection policy (Stage 3: deterministic or probabilistic)
+  4. Temporal context window extraction (Stage 4)
+  5. Multi-candidate REN-guided spatial refinement (Stage 5)
+  6. Optional: Query expansion via memory (Stage 6 — future work)
 
-The two-phase design ensures <10s per query on 100K-frame videos by pre-computing expensive frame embeddings offline.
+The two-phase design ensures **<10s per query** on 100K-frame videos by pre-computing expensive frame embeddings offline.
 
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
