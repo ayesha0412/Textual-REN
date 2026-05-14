@@ -20,7 +20,16 @@ epic_results/
 ego4d_data/
 ego4d_indexes/
 logs/
-checkpoints/
+query_results/
+evaluation_results_P04_01/
+eval/_tmp_eval/
+_tmp_eval/
+eval/evaluation_results/**/*.mp4
+eval/evaluation_results/**/*.jpg
+eval/evaluation_results/**/debug_*
+
+# KEEP checkpoints - needed for inference
+# checkpoints/
 
 # C extensions
 *.so
