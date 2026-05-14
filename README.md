@@ -927,17 +927,3 @@ Note: The `--feature_extractor` argument must match the name of the correspondin
 
 To add support for a new image encoder, update the `FeatureExtractor` class in [`model.py`](https://github.com/savya08/REN/blob/aee7645608dba43a16241ad081a991e5b376d66d/model.py#L16) with the corresponding feature extraction logic, and add a corresponding config file to `configs/`.
 
-
-## License
-This project is released under the MIT License. See [`LICENSE`](LICENSE) for details.
-
-
-## Citing REN
-```
-@inproceedings{khosla2025ren,
-      title={REN: Fast and Efficient Region Encodings from Patch-Based Image Encoders}, 
-      author={Savya Khosla and Sethuraman TV and Barnett Lee and Alexander Schwing and Derek Hoiem},
-      booktitle={Neural Information Processing Systems},
-      year={2025},
-}
-```
