@@ -51,31 +51,43 @@ The pipeline is designed for episodic memory use cases — "where did I last put
 - Textual-REN adapts RELOCATE's region-scoring strategy to free-text queries: CLIP replaces the visual query exemplar, and REN's trained semantic grid replaces manual point annotation
 - Core invariant preserved: **cosine similarity between proposal features and query features in a shared embedding space**
 
+**Textual-REN v2** introduces three training-free architectural improvements:
+- **Grounding DINO** for spatial localization — text-conditioned zero-shot object detection replaces CLIP crop scoring, with CLIP re-ranking to disambiguate multiple detections
+- **CLIP patch-level re-ranking** — max-patch similarity (256 patches per frame) re-ranks FAISS candidates, improving retrieval for small/specific objects
+- **Adaptive threshold** — per-query threshold computed from the similarity distribution (`tau = mean + alpha * std`), replacing the fixed `tau=0.18`
+- **GDino+CLIP verified frame selection** — verifies segment peak candidates with Grounding DINO detection + CLIP crop scoring, filtering color/shape confusion (e.g., red bucket misidentified as "pink flower")
+
 ---
 
 ### Model Architecture
 
-**Textual-REN** combines three foundation models in a modular pipeline:
+**Textual-REN v2** combines four foundation models in a modular pipeline:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                    TEXTUAL-REN MODEL ARCHITECTURE                           │
+│                    TEXTUAL-REN v2 MODEL ARCHITECTURE                        │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │  ┌──────────────────────┐    ┌──────────────────────┐   ┌────────────────┐ │
-│  │  CLIP ViT-g-14       │    │   REN               │   │   SAM2         │ │
-│  │  (OpenCLIP)          │    │   (DINOv2 ViT-L/14) │   │   (segment     │ │
-│  │                      │    │                      │   │   anything v2) │ │
-│  │ 1024-dim embedding   │    │ 32×32 semantic grid  │   │                │ │
-│  │ space for text &     │    │ of region proposals  │   │ Point→Mask→   │ │
-│  │ image patches        │    │ trained on SAM2      │   │ Bbox           │ │
-│  │                      │    │ region masks         │   │                │ │
-│  │ ✓ Online frame       │    │ ✓ Lazy load only     │   │ ✓ Used only    │ │
-│  │   embedding          │    │   on first query     │   │   in full-     │ │
-│  │ ✓ Text encoding      │    │ ✓ DINOv2 backbone:   │   │   quality mode │ │
-│  │ ✓ Spatial crop       │    │   frozen, 518×518    │   │ ✓ Skipped in   │ │
-│  │   scoring            │    │   input              │   │   fast eval    │ │
+│  │  CLIP ViT-g-14       │    │  Grounding DINO      │   │   SAM2         │ │
+│  │  (OpenCLIP)          │    │  (grounding-dino-    │   │   (segment     │ │
+│  │                      │    │   tiny)              │   │   anything v2) │ │
+│  │ 1024-dim embedding   │    │                      │   │                │ │
+│  │ space for text &     │    │ Text-conditioned     │   │ Point/Bbox ->  │ │
+│  │ image patches        │    │ zero-shot object     │   │ Mask -> Bbox   │ │
+│  │                      │    │ detection            │   │                │ │
+│  │ + CLS frame embed    │    │                      │   │ + Used only    │ │
+│  │ + 256 patch tokens   │    │ + Direct text->bbox  │   │   in full-     │ │
+│  │ + Text encoding      │    │ + CLIP re-ranks      │   │   quality mode │ │
+│  │ + Crop verification  │    │   multiple dets      │   │ + Skipped in   │ │
+│  │                      │    │ + Frame verification  │   │   fast eval    │ │
 │  └──────────────────────┘    └──────────────────────┘   └────────────────┘ │
+│                                                                              │
+│  ┌──────────────────────┐                                                   │
+│  │   REN               │   (legacy fallback, spatial_method: "ren_clip")   │
+│  │   (DINOv2 ViT-L/14) │   32x32 semantic grid of region proposals        │
+│  │                      │   Replaced by Grounding DINO in v2               │
+│  └──────────────────────┘                                                   │
 │           │                           │                         │           │
 │  ┌────────┴─────────────────────────┬─┴─────────────────────────┴────────┐  │
 │  │            RELOCATE 6-STAGE PIPELINE (Text Query Adaptation)           │  │
@@ -90,6 +102,15 @@ The pipeline is designed for episodic memory use cases — "where did I last put
 │  │  • For text queries, CLIP's joint 1024-dim embedding space serves   │  │
 │  │    as the cross-modal bridge (no explicit encoder needed)            │  │
 │  │                                                                       │  │
+│  │  STAGE 2c: Patch Re-ranking ✅ (v2)                                    │  │
+│  │  • For FAISS top-100 CLS candidates, compute max_i(cos(text,patch_i))│  │
+│  │  • Blend: 40% CLS + 60% max-patch score                             │  │
+│  │  • Improves retrieval for small/specific objects                     │  │
+│  │                                                                       │  │
+│  │  STAGE 2d: Adaptive Threshold ✅ (v2)                                 │  │
+│  │  • tau = mean + alpha * std, clamped to [0.10, 0.30]                 │  │
+│  │  • Replaces fixed tau=0.18 that failed across diverse queries        │  │
+│  │                                                                       │  │
 │  │  STAGE 3: Selection Policy ✅                                         │  │
 │  │  • Temporal Segmentation: group above-threshold frames (≥2 frames)   │  │
 │  │  • Deterministic modes: "last" (most recent) or "strongest"          │  │
@@ -97,18 +118,24 @@ The pipeline is designed for episodic memory use cases — "where did I last put
 │  │    (nucleus sampling) for multi-candidate refinement                 │  │
 │  │  • Returns: ranked list of candidate frames                          │  │
 │  │                                                                       │  │
+│  │  STAGE 3b: GDino+CLIP Verified Frame Selection ✅ (v2)               │  │
+│  │  • For each segment peak (recent-first), load frame + run GDino      │  │
+│  │  • CLIP-score best crop against query text                           │  │
+│  │  • Accept only if CLIP crop score >= min_crop_verify (0.17)          │  │
+│  │  • Filters color/shape confusion (red bucket != "pink flower")       │  │
+│  │                                                                       │  │
 │  │  STAGE 4: Temporal Sampling ✅                                        │  │
 │  │  • Extract temporal context window: ±0.5 seconds around candidates   │  │
 │  │  • Load frame batch for Stage 5 refinement                           │  │
 │  │  • Ensures spatial locality for accurate region proposal scoring     │  │
 │  │                                                                       │  │
-│  │  STAGE 5: REN-Guided Refinement ✅                                    │  │
-│  │  • For top-K candidates (multi-candidate beam search):               │  │
-│  │    - REN's 32×32 semantic grid (1024 proposals, stride=4 used)      │  │
-│  │    - Crop each proposal, CLIP-encode, score vs text feature         │  │
-│  │  • Best proposal center → (x, y) region point                        │  │
-│  │  • SAM2 point→mask→bbox (or CLIP-tile fast path)                    │  │
-│  │  • Returns: refined candidate with spatial location                  │  │
+│  │  STAGE 5: Spatial Localization ✅ (v2: Grounding DINO)                 │  │
+│  │  • Grounding DINO: text + image -> bounding boxes (zero-shot)        │  │
+│  │  • When multiple detections: CLIP re-ranks crops against query       │  │
+│  │  • Direct bbox output — no REN grid, no SAM2 point->bbox step       │  │
+│  │  • Legacy fallback: REN grid + CLIP crop scoring (spatial_method:    │  │
+│  │    "ren_clip")                                                        │  │
+│  │  • Returns: refined candidate with spatial bbox                      │  │
 │  │                                                                       │  │
 │  │  STAGE 6: Query Expansion via Memory ⏳                              │  │
 │  │  • (Future work) Iterative refinement with pseudo-labeled objects    │  │
@@ -126,25 +153,26 @@ The pipeline is designed for episodic memory use cases — "where did I last put
 
 | Component | Role | Why This Choice |
 |-----------|------|-----------------|
-| **CLIP ViT-g-14** | Text-image alignment | 1024-dim joint space, no fine-tuning needed, strong zero-shot |
-| **REN (DINOv2 ViT-L/14)** | Object-aware spatial proposals | 15–20% better than uniform grids; trained on SAM2 masks to cluster near objects |
+| **CLIP ViT-g-14** | Text-image alignment, patch re-ranking, crop verification | 1024-dim joint space (CLS + 256 patch tokens), no fine-tuning needed |
+| **Grounding DINO** | Spatial localization (v2) | Text-conditioned detection — direct text+image -> bbox, no embedding bridge needed |
+| **REN (DINOv2 ViT-L/14)** | Legacy spatial proposals | 15–20% better than uniform grids; replaced by Grounding DINO in v2 |
 | **SAM2** | Precise mask generation | State-of-the-art segmentation; optional in fast-eval mode |
 
 ---
 
 ### Full Pipeline Architecture
 
-**Textual-REN = CLIP (Stage 1) + Selection Policy (Stage 3) + REN (Stage 5) + RELOCATE (6-stage framework)**.
+**Textual-REN v2 = CLIP (Stage 1-2) + Patch Re-ranking (Stage 2c) + Adaptive Threshold (Stage 2d) + GDino-Verified Selection (Stage 3b) + Grounding DINO (Stage 5) + RELOCATE framework**.
 
 The system implements all 6 stages of RELOCATE (Suris et al., ECCV 2024), adapted for free-text queries:
 
-**Phase 1 (Offline)**: Index video frames with CLIP embeddings + pre-computed OCR text.
-**Phase 2 (Online)**: 6-stage pipeline:
-  1. CLIP text encoding → similarity scores (Stage 1)
-  2. Cross-modal scoring in CLIP's joint embedding space (Stage 2 — implicit)
-  3. Temporal segmentation + selection policy (Stage 3: deterministic or probabilistic)
+**Phase 1 (Offline)**: Index video frames with CLIP CLS embeddings + patch tokens + pre-computed OCR text.
+**Phase 2 (Online)**: Enhanced pipeline:
+  1. CLIP text encoding + similarity scores (Stage 1)
+  2. Cross-modal scoring + OCR fusion + patch re-ranking + adaptive threshold (Stage 2)
+  3. Temporal segmentation + GDino+CLIP verified frame selection (Stage 3)
   4. Temporal context window extraction (Stage 4)
-  5. Multi-candidate REN-guided spatial refinement (Stage 5)
+  5. Grounding DINO spatial localization with CLIP re-ranking (Stage 5)
   6. Optional: Query expansion via memory (Stage 6 — future work)
 
 The two-phase design ensures **<10s per query** on 100K-frame videos by pre-computing expensive frame embeddings offline.
@@ -175,20 +203,24 @@ The two-phase design ensures **<10s per query** on 100K-frame videos by pre-comp
 ┌──────────┐             │
 │  Frame   │             │
 │Embedding │             │
-│(1024-dim)│             │
+│CLS 1024d │             │
+│+ 256     │             │
+│ patches  │             │
 └────┬─────┘             │
      └────────┬──────────┘
               ▼
   ┌───────────────────────────────────┐
   │     FAISS Flat Index              │  exact cosine search, GPU-accel
   │  +  metadata.json                 │  frame_idx, timestamp, OCR texts
-  │  +  clip_embeddings.npy           │  (N_frames × 1024) float32
+  │  +  clip_embeddings.npy           │  (N × 1024) CLS embeddings
+  │  +  patch_embeddings.npy          │  (N × 256 × 1024) patch tokens (v2)
   └───────────────────────────────────┘
 
   Saved to:  epic_kitchen_indexes/<video_id>/
              ├── faiss.index
-             ├── metadata.json        ← includes OCR per frame
-             └── clip_embeddings.npy
+             ├── metadata.json         ← includes OCR per frame
+             ├── clip_embeddings.npy    ← CLS embeddings
+             └── patch_embeddings.npy   ← patch tokens for re-ranking (v2)
 
 
 ╔══════════════════════════════════════════════════════════════════════╗
@@ -357,19 +389,49 @@ Similarity over time:
                                     SELECTED (last)
 ```
 
-#### 7. Crop Verification
-Before committing to a segment, a fast 3×3 CLIP crop grid scores whether the object is actually visible in the candidate frame. If the score is too low, the pipeline backtracks to an earlier segment. If all segments fail, the **last segment** is used as a fallback (right timeframe with uncertain spatial location is better than a wrong timeframe).
+#### 7. GDino+CLIP Verified Frame Selection (v2)
+Before committing to a segment peak, the pipeline verifies that the queried object is actually detectable in that frame. For each candidate (recent-first):
+1. Load the frame and run Grounding DINO detection
+2. CLIP-score the best detection crop against the text query
+3. Accept only if CLIP crop score >= `min_crop_verify` (default 0.17)
+4. If rejected, try the next segment peak (up to 8 candidates)
 
-#### 8. REN-Guided Spatial Localization
-The spatial location of the object within the frame is found using REN's 32×32 semantic grid (1024 region proposals trained on DINOv2 features and SAM2 masks). This directly implements the **RELOCATE region-search step** adapted for text queries:
+This filters **color/shape confusion** — e.g., a red bucket scored as "pink flower in a pot" by Grounding DINO alone gets rejected because the CLIP crop score (0.126) is below threshold. The pipeline backtracks to an earlier segment where the real object is visible.
 
-1. Extract REN's 32×32 grid points from the candidate frame (sampled with stride=4 → 256 proposals for speed)
-2. Crop a small patch (±radius) around each grid point
-3. Encode each crop with CLIP image encoder (same embedding space as the text query)
-4. Score all crops via cosine similarity with the text embedding
-5. The center of the highest-scoring crop becomes the `region_point` (x, y) input to SAM2
+#### 8. Grounding DINO Spatial Localization (v2)
+**Replaces** the REN grid + CLIP crop scoring approach. Grounding DINO is a text-conditioned zero-shot object detector that takes raw text + image and outputs bounding boxes directly — no embedding space bridging needed.
 
-This approach is **object-aware** because REN's grid is trained to cluster densely around object boundaries (via SAM2 region masks), unlike a uniform pixel grid. Per-query compute: ~100ms on GPU.
+1. Text query + frame image → Grounding DINO → list of (bbox, confidence, label)
+2. When multiple detections exist: extract each crop, encode with CLIP, score against text query
+3. Select the detection with highest CLIP similarity (not just highest GDino confidence)
+4. Return bbox directly — no SAM2 point→mask→bbox step needed
+
+Per-query compute: ~200ms on GPU. No training required.
+
+**Why Grounding DINO replaces REN+CLIP**: The original approach used REN's 32×32 grid to generate spatial proposals, then scored each crop with CLIP. This used CLIP for sub-region spatial discrimination — something it wasn't designed for (CLIP encodes semantic meaning, not spatial precision). Grounding DINO is purpose-built for this task.
+
+#### 8b. CLIP Patch-Level Re-ranking (v2)
+FAISS retrieval uses CLIP CLS tokens (whole-frame embedding) which dilute small objects. CLIP patch tokens (256 per frame, 1024-dim, projected to joint space via `visual.ln_post @ visual.proj`) provide local signal:
+
+1. FAISS returns top-100 frames by CLS similarity (unchanged)
+2. For each top-100 frame, compute `max_i(cos(text, patch_i))` — the peak local patch signal
+3. Blend: `reranked = 0.4 * CLS + 0.6 * max_patch`
+4. Feed re-ranked scores into temporal segmentation
+
+This dramatically improves retrieval for small or specific objects where the CLS embedding is dominated by scene context.
+
+#### 8c. Adaptive Threshold (v2)
+Different queries have vastly different similarity distributions. A fixed threshold (tau=0.18) fails across diverse queries. The adaptive threshold computes tau per-query:
+
+```
+tau = mean(sims) + alpha * std(sims)    # alpha default: 1.0
+tau = clamp(tau, 0.10, 0.30)
+```
+
+This automatically adjusts for easy queries ("fork", high mean similarity) vs hard queries ("pink flower in a pot", low mean similarity).
+
+#### 8d. Legacy: REN-Guided Spatial Localization (fallback)
+Available via `spatial_method: "ren_clip"` in config. Uses REN's 32×32 semantic grid (1024 proposals trained on DINOv2 features and SAM2 masks) with CLIP crop scoring. Kept as a fallback but not recommended — Grounding DINO is more accurate and doesn't require the REN checkpoint.
 
 #### 9. SAM2 Point → Mask → Bbox (or Fast Path)
 From the REN-guided region point, SAM2 proposes multiple mask candidates. Each is scored by CLIP on its cropped region. Size limits (0.1%–12% of frame area, relaxed to 60% for large-area objects) filter out noise masks and full-frame masks. The highest-scoring valid mask is selected.
@@ -532,9 +594,10 @@ Else:
 
 | File | Purpose | Key Functions |
 |------|---------|---|
-| `text_query/query_indexed.py` | Phase 2 query engine | `IndexedQueryEngine.query()`, `_ren_guided_localize()` |
+| `text_query/query_indexed.py` | Phase 2 query engine | `IndexedQueryEngine.query()`, `CandidateRefiner`, `SelectionPolicy` |
+| `text_query/grounding_dino.py` | **(v2)** Spatial localization | `GroundingDINOLocalizer.detect()`, `best_box()` with CLIP re-ranking |
 | `text_query/localizer.py` | CLIP + SAM2 utilities | `TextQueryLocalizer.encode_text()`, `point_to_bbox()` |
-| `text_query/prepare_index.py` | Phase 1 indexing | `prepare_faiss_index()`, OCR extraction via EasyOCR |
+| `text_query/prepare_index.py` | Phase 1 indexing | `prepare_faiss_index()`, `_extract_patch_tokens_batch()`, OCR via EasyOCR |
 | `visual_query/models.py` | REN model class | `REN.__init__()`, `REN.forward()`, grid_points initialization |
 | `visual_query/vq_utils.py` | SAM2 interface | `get_sam_region_from_points()`, mask→bbox utilities |
 
@@ -573,15 +636,20 @@ Key settings in `text_query/config.yaml`:
 
 | Parameter | Default | Purpose |
 |-----------|---------|---------|
-| `similarity_threshold` | 0.18 | CLIP cosine cutoff for candidate frames |
-| `context_seconds` | 5.0 | Duration of context window around last occurrence (indexing); 0.5 for interactive eval |
+| `similarity_threshold` | 0.18 | CLIP cosine cutoff (used when adaptive_threshold is off) |
+| `adaptive_threshold` | true | **(v2)** Compute per-query threshold from similarity distribution |
+| `threshold_alpha` | 1.0 | **(v2)** tau = mean + alpha * std, clamped to [0.10, 0.30] |
+| `spatial_method` | `"grounding_dino"` | **(v2)** `"grounding_dino"` (default) or `"ren_clip"` (legacy) |
+| `context_seconds` | 0.5 | Duration of context window around last occurrence |
 | `frame_sample_rate` | 10 | Index every Nth frame (1=all, 10≈6fps at 60fps) |
 | `ocr_weight` | 0.3 | Fusion weight for OCR score (0=disabled) |
-| `min_crop_verify` | 0.17 | CLIP crop score threshold for accepting candidate frame |
+| `min_crop_verify` | 0.17 | CLIP crop score threshold for GDino+CLIP frame verification |
 | `sam_inference_size` | 512 | SAM2 input resolution (smaller = faster; 1024 = full quality) |
-| `skip_sam2_eval` | true | **Fast path**: skip SAM2, use fixed-size bbox instead (~3–8s/query) |
-| `last_segment_min_peak` | 0.18 | Absolute minimum peak similarity to trust last segment |
-| `last_segment_min_rel` | 0.60 | Relative to global peak (last must be ≥ 60% of best) |
+| `skip_sam2_eval` | true | **Fast path**: skip SAM2, use GDino bbox directly |
+| `faiss.use_patch_rerank` | true | **(v2)** Re-rank FAISS top-k using CLIP patch tokens |
+| `faiss.patch_top_k` | 100 | **(v2)** How many CLS candidates to re-rank with patches |
+| `grounding_dino.box_threshold` | 0.20 | **(v2)** GDino detection confidence threshold |
+| `grounding_dino.text_threshold` | 0.20 | **(v2)** GDino text matching threshold |
 
 **Performance profiles:**
 
@@ -786,11 +854,12 @@ python benchmark.py --queries annotated_testset.json --mode clip_only
 ```
 REN/
 ├── text_query/
-│   ├── config.yaml              ← thresholds, sample rate, OCR weight
-│   ├── prepare_index.py         ← Phase 1: build FAISS index from video
+│   ├── config.yaml              ← thresholds, sample rate, model configs
+│   ├── grounding_dino.py        ← (v2) Grounding DINO spatial localizer
+│   ├── prepare_index.py         ← Phase 1: build FAISS index + patch tokens
 │   ├── query_indexed.py         ← Phase 2: query engine (full pipeline)
 │   ├── localizer.py             ← CLIP, SAM2, tracking utilities
-│   ├── adapters.py              ← CLIP→REN bridge layer
+│   ├── adapters.py              ← CLIP→REN bridge layer (legacy, unused)
 │   └── download_epic_kitchen.py ← dataset download via yt-dlp
 │
 ├── eval/
@@ -808,7 +877,7 @@ REN/
 │       └── ...
 │
 ├── epic_kitchen_indexes/        ← built by index_all_videos.py
-│   ├── P01_01/  faiss.index  metadata.json  clip_embeddings.npy
+│   ├── P01_01/  faiss.index  metadata.json  clip_embeddings.npy  patch_embeddings.npy
 │   ├── P02_01/
 │   └── ...
 │
@@ -825,14 +894,22 @@ REN/
 
 ```yaml
 text_query:
-  similarity_threshold: 0.18   # CLIP cosine threshold for candidate frames
-  use_compositional: false      # query decomposition (future work)
-  context_seconds: 5.0          # ±N/2 seconds context window for tracking
+  similarity_threshold: 0.18   # CLIP cosine threshold (fallback when adaptive is off)
+  adaptive_threshold: true      # (v2) per-query threshold from similarity distribution
+  threshold_alpha: 1.0          # (v2) tau = mean + alpha*std, clamped [0.10, 0.30]
+  spatial_method: "grounding_dino"  # (v2) "grounding_dino" or "ren_clip" (legacy)
+  context_seconds: 0.5          # ±N/2 seconds context window
   frame_sample_rate: 10         # index every Nth frame (10 = ~6 fps at 60 fps)
   ocr_weight: 0.3               # weight of OCR score in fused similarity
-  min_crop_verify: 0.17         # min crop score to accept a candidate segment
-  last_segment_min_peak: 0.18   # min peak to trust last segment
-  last_segment_min_rel: 0.60    # last segment must be ≥60% of global peak
+  min_crop_verify: 0.17         # min CLIP crop score for GDino+CLIP frame verification
+  faiss:
+    use_patch_rerank: true      # (v2) re-rank top-k using CLIP patch tokens
+    patch_top_k: 100            # (v2) how many CLS candidates to re-rank
+
+grounding_dino:                 # (v2) text-conditioned zero-shot detection
+  model_id: 'IDEA-Research/grounding-dino-tiny'
+  box_threshold: 0.20
+  text_threshold: 0.20
 ```
 
 ---
