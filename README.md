@@ -194,10 +194,10 @@ The two-phase design ensures **<10s per query** on 100K-frame videos by pre-comp
     │                    │
     ▼                    ▼
 ┌──────────┐      ┌──────────────┐
-│  CLIP    │      │  EasyOCR     │  brand/label text only
-│ ViT-g-14 │      │  (every 5th  │  word, conf stored per frame
-│(OpenCLIP)│      │   sampled    │  — used only for brand queries
-└────┬─────┘      │   frame)     │
+│  CLIP    │      │  OCR         │  supplementary: brand/label
+│ ViT-g-14 │      │  (every 5th  │  text detection only.
+│(OpenCLIP)│      │   sampled    │  Not used for general object
+└────┬─────┘      │   frame)     │  queries ("knife", "plate").
      │            └──────┬───────┘
      ▼                   │
 ┌──────────┐             │
@@ -253,12 +253,12 @@ The two-phase design ensures **<10s per query** on 100K-frame videos by pre-comp
   └────────────────┬───────────────────────────┘
                    │
         ┌──────────▼──────────┐
-        │   OCR Fusion        │  BRAND PATH ONLY — kept completely
-        │   (brand path only) │  separate from object scoring.
-        │                     │  ocr_score from stored EasyOCR texts,
-        │  fused = CLIP       │  fuzzy-matched with rapidfuzz.
-        │        + 0.3×OCR    │  High-confidence OCR (>=0.85) routes
-        └──────────┬──────────┘  directly to OCR bbox.
+        │   OCR Fusion        │  BRAND PATH ONLY — supplementary.
+        │   (brand path only) │  OCR score from stored text detections,
+        │                     │  fuzzy-matched with rapidfuzz.
+        │  fused = CLIP       │  High-confidence OCR (>=0.85) routes
+        │        + 0.3×OCR    │  directly to OCR bbox, else uses
+        └──────────┬──────────┘  Grounding DINO like the object path.
                    │
                    ▼
   ┌────────────────────────────────────────┐
@@ -313,7 +313,7 @@ The two-phase design ensures **<10s per query** on 100K-frame videos by pre-comp
                    │
         ┌──────────▼──────────┐
         │  OCR Direct Bbox    │  (brand path only, OCR score >= 0.85)
-        │  EasyOCR readtext() │  → precise text region bbox
+        │  OCR readtext()     │  → precise text region bbox
         │  + 80% padding      │  expanded to full product label
         └──────────┬──────────┘
                    │  (or object path: use GDino bbox)
@@ -364,13 +364,14 @@ The two-phase design ensures **<10s per query** on 100K-frame videos by pre-comp
 #### 3. FAISS Flat Index
 Stores all frame embeddings for exact cosine search. GPU-accelerated when available. The index supports sub-second search over videos with 100 K+ frames. Separate `clip_embeddings.npy` enables batched similarity computation for ablations.
 
-#### 4. EasyOCR (Brand/Label Text Detection)
-**Role**: Product brand identification for queries like "Heinz", "Fairy", "Yorkshire Tea".
-- Pre-computed at indexing time (Phase 1) on every 5th sampled frame
+#### 4. OCR Text Detection (Brand/Label Queries Only)
+**Role**: Product brand identification for queries like "Heinz", "Fairy", "Yorkshire Tea". This is a **supplementary path** — the primary pipeline is CLIP + Grounding DINO.
+- Pre-computed at indexing time (Phase 1) on every 5th sampled frame using EasyOCR
 - Stored in `metadata.json` per frame: detected words + confidence scores
-- At query time (Phase 2): `rapidfuzz` fuzzy-matches the query string against stored OCR texts
-- **Fusion strategy**: Completely separate path for brand queries (score ≥ 0.85 triggers direct OCR-based bbox, skipping SAM2)
-- Alternative models available: PaddleOCR (3–5× faster, better on rotated text) can replace EasyOCR with minimal changes
+- At query time: `rapidfuzz` fuzzy-matches the query string against stored OCR texts
+- **Only active for brand queries** — general object queries (e.g., "kitchen knife") never use OCR
+- High-confidence OCR match (≥ 0.85) triggers direct OCR-based bbox, skipping Grounding DINO
+- OCR engine is swappable (PaddleOCR, etc.) — only the indexing step changes
 
 #### 5. Query Type Classifier (`_is_brand_query`)
 Automatically routes queries to the correct scoring path:
@@ -442,10 +443,12 @@ This automatically adjusts for easy queries ("fork", high mean similarity) vs ha
 #### 8d. Legacy: REN-Guided Spatial Localization (fallback)
 Available via `spatial_method: "ren_clip"` in config. Uses REN's 32×32 semantic grid (1024 proposals trained on DINOv2 features and SAM2 masks) with CLIP crop scoring. Kept as a fallback but not recommended — Grounding DINO is more accurate and doesn't require the REN checkpoint.
 
-#### 9. SAM2 Point → Mask → Bbox (or Fast Path)
-From the REN-guided region point, SAM2 proposes multiple mask candidates. Each is scored by CLIP on its cropped region. Size limits (0.1%–12% of frame area, relaxed to 60% for large-area objects) filter out noise masks and full-frame masks. The highest-scoring valid mask is selected.
+#### 9. SAM2 Mask Refinement (Optional)
+In v2, **SAM2 is optional** — Grounding DINO provides bounding boxes directly, so there is no mandatory point→mask→bbox step.
 
-**Fast evaluation mode (`skip_sam2_eval: true`)**: For interactive evaluation, SAM2 is skipped entirely. Instead, a fixed-size bbox is computed directly from the region point (center ± 1/4 frame width/height). This reduces per-query time from 20–60s (SAM2) to <1s with minimal accuracy loss.
+**Default mode (`skip_sam2_eval: true`)**: Grounding DINO's bbox output is used directly. This is the recommended mode for interactive evaluation and fast feedback (~200ms per query).
+
+**Full-quality mode (`skip_sam2_eval: false`)**: The center of the Grounding DINO bbox is fed to SAM2 as a point prompt. SAM2 proposes refined mask candidates, scored by CLIP on their cropped regions. Size limits (0.1%–12% of frame area, relaxed to 60% for large-area objects) filter out noise masks. The highest-scoring valid mask produces the final bbox. This adds 20–60s latency but can improve mask precision.
 
 #### 10. Ablation Modes
 Six modes for comparative evaluation:
@@ -570,9 +573,9 @@ For each frame:
 
 If OCR score ≥ 0.85 (high confidence):
   → Direct OCR-based bbox: readtext() → text region → ±80% padding
-  → Skip SAM2 entirely
+  → Skip Grounding DINO localization
 Else:
-  → Use standard REN + SAM2 path
+  → Use Grounding DINO localization path (text + frame → bbox)
 ```
 
 ---
@@ -586,7 +589,7 @@ Else:
 | `text_query/query_indexed.py` | Phase 2 query engine | `IndexedQueryEngine.query()`, `CandidateRefiner`, `SelectionPolicy` |
 | `text_query/grounding_dino.py` | **(v2)** Spatial localization | `GroundingDINOLocalizer.detect()`, `best_box()` with CLIP re-ranking |
 | `text_query/localizer.py` | CLIP + SAM2 utilities | `TextQueryLocalizer.encode_text()`, `point_to_bbox()` |
-| `text_query/prepare_index.py` | Phase 1 indexing | `prepare_faiss_index()`, `_extract_patch_tokens_batch()`, OCR via EasyOCR |
+| `text_query/prepare_index.py` | Phase 1 indexing | `prepare_faiss_index()`, `_extract_patch_tokens_batch()`, OCR text detection |
 | `visual_query/models.py` | REN model class | `REN.__init__()`, `REN.forward()`, grid_points initialization |
 | `visual_query/vq_utils.py` | SAM2 interface | `get_sam_region_from_points()`, mask→bbox utilities |
 
@@ -651,7 +654,7 @@ Key settings in `text_query/config.yaml`:
 
 Results on EPIC-KITCHENS P01–P05 (5 videos, 50 total queries: 25 OCR + 25 general):
 
-#### Full Pipeline (`full` mode: CLIP + REN + SAM2)
+#### Full Pipeline (`full` mode: CLIP + Grounding DINO + Patch Re-ranking)
 | Query Type | mIoU | Success@25 | Success@50 | Temporal Error (s) |
 |------------|------|-----------|-----------|-------------------|
 | OCR/Brand | 0.78 | 0.92 | 0.68 | 1.2 |
