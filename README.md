@@ -257,67 +257,74 @@ The two-phase design ensures **<10s per query** on 100K-frame videos by pre-comp
         │   (brand path only) │  separate from object scoring.
         │                     │  ocr_score from stored EasyOCR texts,
         │  fused = CLIP       │  fuzzy-matched with rapidfuzz.
-        │        + 0.3×OCR    │  High-confidence OCR (≥0.85) routes
-        └──────────┬──────────┘  directly to OCR bbox, skipping SAM2.
+        │        + 0.3×OCR    │  High-confidence OCR (>=0.85) routes
+        └──────────┬──────────┘  directly to OCR bbox.
+                   │
+                   ▼
+  ┌────────────────────────────────────────┐
+  │   Patch Re-ranking (v2)                │
+  │                                        │
+  │  For FAISS top-100 CLS candidates:     │
+  │  max_patch = max_i(cos(text, patch_i)) │
+  │  reranked = 0.4*CLS + 0.6*max_patch   │
+  └────────────────┬───────────────────────┘
+                   │
+                   ▼
+  ┌────────────────────────────────────────┐
+  │   Adaptive Threshold (v2)              │
+  │                                        │
+  │  tau = mean(sims) + alpha * std(sims)  │  alpha=1.0
+  │  tau = clamp(tau, 0.10, 0.30)          │  per-query, not fixed
+  └────────────────┬───────────────────────┘
                    │
                    ▼
   ┌────────────────────────────────────────┐
   │   Temporal Segmentation                │
   │                                        │
-  │  1. Keep frames where sim ≥ threshold  │  default: 0.18
+  │  1. Keep frames where sim >= threshold │  adaptive tau
   │  2. Group into contiguous segments     │  gap > 2s = new segment
-  │  3. Filter: keep segments ≥ 2 frames   │
-  │  4. Select LAST valid segment          │  most recent occurrence
+  │  3. Filter: keep segments >= 2 frames  │
+  │  4. Return ALL segment peaks           │  sorted recent-first
   └────────────────┬───────────────────────┘
                    │
                    ▼
   ┌────────────────────────────────────────┐
-  │   Crop Verification                    │
+  │   GDino+CLIP Frame Verification (v2)   │
   │                                        │
-  │  For each segment (last → first):      │
-  │    similarity score ≥ 0.17 → accept ✓  │
-  │    else → try previous segment         │
-  │  Fallback: use LAST segment            │  most recent = best default
+  │  For each segment peak (recent-first): │
+  │    1. Load frame, run Grounding DINO   │
+  │    2. CLIP-score best crop vs query    │
+  │    3. If CLIP crop >= 0.17 → accept    │
+  │    4. Else → try next segment peak     │
+  │  Filters color/shape confusion         │
   └────────────────┬───────────────────────┘
                    │
                    ▼
   ┌────────────────────────────────────────┐
-  │   REN-Guided Spatial Localization      │  ← RELOCATE region search,
-  │   (_ren_guided_localize)               │    adapted for text queries
+  │   Grounding DINO Localization (v2)     │
   │                                        │
-  │  REN 32×32 semantic grid → 1024        │
-  │  spatial proposals in frame space      │
+  │  text query + frame → GDino → bboxes   │
+  │  Multiple dets → CLIP re-ranks crops   │
+  │  → best bbox [x,y,w,h] directly       │
   │                                        │
-  │  Each proposal cropped + CLIP-encoded  │  batch inference on GPU
-  │  → cosine sim with text_feat           │  (same CLIP embedding space)
-  │                                        │
-  │  → Best proposal center = region_point │
-  │    (x, y) pixel coordinates            │
-  │                                        │
-  │  Note: REN's grid is object-aware      │
-  │  (trained on SAM2 region masks via     │
-  │  DINOv2) — denser coverage near        │
-  │  object boundaries than a uniform grid │
+  │  No REN grid, no SAM2 point→mask step  │
+  │  Per-query: ~200ms on GPU              │
   └────────────────┬───────────────────────┘
                    │
         ┌──────────▼──────────┐
-        │  OCR Direct Bbox    │  (brand path, OCR score ≥ 0.85)
+        │  OCR Direct Bbox    │  (brand path only, OCR score >= 0.85)
         │  EasyOCR readtext() │  → precise text region bbox
         │  + 80% padding      │  expanded to full product label
         └──────────┬──────────┘
-                   │  (or object path: use region_point below)
+                   │  (or object path: use GDino bbox)
                    ▼
   ┌────────────────────────────────────────┐
-  │   SAM2 Point → Mask → Bbox            │
-  │   (or CLIP-tile fast path when         │
-  │    skip_sam2_eval: true)               │
+  │   SAM2 Mask Refinement (optional)      │
+  │   (skip_sam2_eval: true = skipped)     │
   │                                        │
-  │  Input:  region_point (x, y)           │
-  │  SAM2 predicts multi-mask proposals    │
-  │  Each mask scored by CLIP crop sim     │
-  │  Size filter: 0.1% – 12% of frame     │
-  │    (60% for large objects)             │
-  │  → Best scored mask → bbox [x,y,w,h]  │
+  │  When enabled: GDino bbox center →     │
+  │  SAM2 point prompt → refined mask      │
+  │  Default: use GDino bbox directly      │
   └────────────────┬───────────────────────┘
                    │
                    ▼
@@ -340,18 +347,19 @@ The two-phase design ensures **<10s per query** on 100K-frame videos by pre-comp
 ### Component Details
 
 #### 1. CLIP ViT-g-14 (OpenCLIP, laion2b)
-**Role**: Frame retrieval (Phase 1) + text encoding (Phase 2) + spatial scoring (Phase 2).
+**Role**: Frame retrieval + text encoding + patch re-ranking + crop verification.
 - 1024-dim joint embedding space enables direct cosine similarity between text queries and video frames without fine-tuning
-- Offline: encodes every Nth frame (default N=10) and stores embeddings in FAISS index
-- Online: encodes text query and each spatial crop (in REN-guided localization) in the same space
+- **CLS tokens**: Offline frame embeddings for FAISS retrieval
+- **Patch tokens** (v2): 256 patches per frame, projected to 1024-dim joint space via `visual.ln_post @ visual.proj`, used for re-ranking
+- **Crop verification** (v2): Scores Grounding DINO detection crops against text query to filter false positives
 
-#### 2. REN (Region Encoder Network) — DINOv2 ViT-L/14
-**Role**: Object-aware spatial proposals via 32×32 semantic grid.
-- **Backbone**: Frozen DINOv2 ViT-L/14 patch features (14×14 patch size, 518×518 input)
-- **Grid**: 32×32 = 1024 region proposals, trained on SAM2 region masks to cluster densely around object boundaries
-- **Loaded lazily** on first query to save VRAM during indexing (prevents ~3–4 GB overhead in `prepare_index.py`)
-- **Output**: `grid_points` tensor (32², 2) = pixel coordinates of spatial proposals in 518×518 frame space
-- **Why REN**: Outperforms uniform grids by 15–20% (denser sampling near objects), matches SAM performance while being **60× faster**
+#### 2. Grounding DINO (v2) — IDEA-Research/grounding-dino-tiny
+**Role**: Text-conditioned spatial localization (replaces REN grid + CLIP crop scoring).
+- Takes raw text query + image, outputs bounding boxes with confidence scores
+- **No embedding bridge needed**: directly outputs spatial coordinates from text
+- When multiple detections exist, CLIP re-ranks crops to pick best semantic match
+- **Lazy-loaded** on first query, offloaded to CPU when not in use
+- **Why Grounding DINO**: Purpose-built for text-conditioned detection; the old approach used CLIP for sub-region spatial discrimination (wrong tool for the job)
 
 #### 3. FAISS Flat Index
 Stores all frame embeddings for exact cosine search. GPU-accelerated when available. The index supports sub-second search over videos with 100 K+ frames. Separate `clip_embeddings.npy` enables batched similarity computation for ablations.
@@ -375,18 +383,19 @@ Automatically routes queries to the correct scoring path:
 | All words in common vocab | `kitchen knife`, `red switch`, `dustbin` | Pure CLIP |
 
 #### 6. Temporal Segmentation
-Rather than returning the frame with highest similarity, the pipeline segments the similarity curve into contiguous temporal windows. This avoids isolated false-positive spikes and returns the **last genuine segment** — the most recent occasion when the object was consistently visible.
+Rather than returning the frame with highest similarity, the pipeline segments the similarity curve into contiguous temporal windows. This avoids isolated false-positive spikes and returns the **last verified segment** — the most recent occasion when the object is both above-threshold and confirmed by Grounding DINO.
 
 ```
-Similarity over time:
+Similarity over time (adaptive threshold):
   0.25 │         ██                      ██
   0.20 │        ████     ██             ████
-  0.18 │───────██████───████────────────████─── threshold
+  tau  │───────██████───████────────────████─── adaptive threshold
   0.15 │      ██████   ██████          ██████
        └─────────────────────────────────────► time
               seg 1     seg 2           seg 3
                                           ▲
-                                    SELECTED (last)
+                            GDino+CLIP verifies each peak
+                            (recent-first) until one passes
 ```
 
 #### 7. GDino+CLIP Verified Frame Selection (v2)
@@ -456,112 +465,92 @@ Six modes for comparative evaluation:
 
 #### Frame Retrieval Algorithm (Phase 2, Steps 1–4)
 ```
-Input: text_query, faiss_index, metadata (OCR per frame)
-Output: last_frame_idx, region_score
+Input: text_query, faiss_index, patch_embeddings, metadata (OCR per frame)
+Output: last_frame_idx, verified by Grounding DINO
 
-1. Encode text_query with CLIP tokenizer & encoder → text_feat (1, 1024)
+1. Encode text_query with CLIP tokenizer & encoder -> text_feat (1, 1024)
 
-2. Query FAISS index: text_feat · clip_embeddings → (N_frames,) similarity scores
-   - For BRAND queries: fuse OCR score using rapidfuzz fuzzy matching
-     fused_score = clip_sim + 0.3 × ocr_match_score
-   - For OBJECT queries: use pure clip_sim
+2. Similarity scoring:
+   a. CLS: text_feat · clip_embeddings -> (N_frames,) cosine sims
+   b. For BRAND queries: fuse OCR score (rapidfuzz fuzzy matching)
+      fused_score = clip_sim + 0.3 * ocr_match_score
+   c. Patch re-ranking (v2): for top-100 CLS candidates,
+      max_patch = max_i(cos(text_feat, patch_i))  (256 patches per frame)
+      reranked = 0.4 * CLS + 0.6 * max_patch
+   d. Adaptive threshold (v2):
+      tau = mean(sims) + alpha * std(sims), clamped to [0.10, 0.30]
 
 3. Temporal Segmentation:
-   - Keep frames where sim ≥ threshold (default 0.18)
-   - Group contiguous frames into segments
+   - Keep frames where sim >= adaptive tau
+   - Group contiguous frames into segments (gap > 2s = new segment)
    - Filter out segments < 2 frames
-   - Select LAST valid segment (most recent)
+   - Return ALL segment peaks sorted recent-first
 
-4. Crop Verification (backtrack if needed):
-   - For last segment, score candidate frame with 3×3 CLIP crop grid
-   - If crop_score ≥ min_crop_verify (0.17): accept last segment → last_frame_idx
-   - Else: try previous segment
-   - Fallback: use last segment regardless (right time is better than wrong time)
+4. GDino+CLIP Frame Verification (v2):
+   - For each segment peak (recent-first, up to 8):
+     a. Load frame, run Grounding DINO detection
+     b. CLIP-score best detection crop against text query
+     c. If CLIP crop score >= min_crop_verify (0.17): accept -> last_frame_idx
+     d. Else: reject (color/shape confusion), try next peak
+   - Fallback: use best-scoring unverified candidate
 ```
 
-**Time Complexity**: O(N) for FAISS search + O(K) for segmentation (K = num segments)
-**Space Complexity**: O(N) for frame embeddings stored in FAISS index
+**Time Complexity**: O(N) for FAISS + O(K) for segmentation + O(8) for GDino verification
+**Space Complexity**: O(N * 256 * 1024) for patch embeddings
 
-#### Spatial Localization Algorithm (Phase 2, Step 5: REN-Guided)
+#### Spatial Localization Algorithm (Phase 2, Step 5: Grounding DINO)
 ```
-Input: last_frame_rgb (h, w, 3), text_feat (1024,), REN model
-Output: region_point (x, y), region_score ∈ [0, 1]
+Input: last_frame_rgb (h, w, 3), text_query (string), CLIP model
+Output: bbox [x, y, w, h], clip_score
 
-1. Load REN's grid_points: (32, 32, 2) → (1024, 2) array of (y, x) in 518×518 space
-   ren.grid_points: sorted row-major, normalized to [1, 517]
+1. Run Grounding DINO:
+   detections = gdino.detect(frame, text_query, box_thresh=0.20, text_thresh=0.20)
+   Each detection: (bbox_xywh, confidence, label)
 
-2. Scale grid to frame dimensions:
-   scale_y = h / 518.0
-   scale_x = w / 518.0
+2. If no detections: return frame center with score 0.0
 
-3. For each grid point (stride=4 for speed):
-   py_norm, px_norm = grid_points[i]
-   py = int(py_norm × scale_y)
-   px = int(px_norm × scale_x)
+3. CLIP re-ranking (when multiple detections):
+   For each detection:
+     crop = frame[y:y+h, x:x+w]
+     crop_feat = clip_model.encode_image(preprocess(crop))  -> (1, 1024)
+     clip_sim = cos(crop_feat, text_feat)
    
-   Crop patch: frame[py±patch_r, px±patch_r] (patch_r = max(32, min(h,w)//8))
-   
-   Preprocess patch with CLIP preprocessing
-   Batch all crops on GPU
+   best_det = argmax(clip_sims)  (highest CLIP similarity, not GDino confidence)
 
-4. Encode all crops with CLIP image encoder:
-   crop_feats = clip_model.encode_image(crop_batch)  → (num_crops, 1024)
-   L2-normalize: crop_feats = crop_feats / ||crop_feats||
-
-5. Score each crop:
-   scores = crop_feats @ text_feat  → (num_crops,) cosine similarities
-   best_idx = argmax(scores)
-   region_point = centers[best_idx]  → (x, y) in frame pixels
-   region_score = scores[best_idx]  → [0, 1]
+4. Return: bbox = best_det.bbox, score = best_det.clip_sim
 ```
 
-**Time Complexity**: O(num_grid_points / stride) × O(CLIP encode time)
-**Space Complexity**: O(num_crops × 1024) for crop embeddings
-**GPU Memory**: ~100MB for 256 crops @ 224×224 pixels
+**Time Complexity**: O(1) GDino forward pass + O(num_dets) CLIP crop encodes
+**Space Complexity**: O(num_dets * 1024) for crop embeddings
+**GPU Memory**: ~500MB for GDino model + ~50MB for CLIP crops
 
 #### Bbox Generation: Two Paths
 
-**Path A: Fast Evaluation (`skip_sam2_eval: true`)**
+**Path A: Grounding DINO direct (`skip_sam2_eval: true`, default)**
 ```
-Input: region_point (x, y), frame (h, w, 3)
+Input: text_query, frame (h, w, 3), CLIP model
 Output: bbox [x, y, w, h]
 
-bbox_width = max(64, w // 4)
-bbox_height = max(64, h // 4)
-x_min = max(0, x - bbox_width // 2)
-y_min = max(0, y - bbox_height // 2)
-bbox = [x_min, y_min, bbox_width, bbox_height]
+Grounding DINO outputs bbox directly from text + image.
+When multiple detections: CLIP re-ranks and picks best crop.
+No intermediate point->mask step needed.
 
-Time: O(1) — constant time
-Use: Interactive annotation, real-time feedback
+Time: ~200ms on GPU
+Use: Default mode, interactive annotation, real-time feedback
 ```
 
-**Path B: Accurate (`skip_sam2_eval: false`)**
+**Path B: GDino + SAM2 refinement (`skip_sam2_eval: false`)**
 ```
-Input: region_point (x, y), frame (h, w, 3), text_feat (1024,)
+Input: text_query, frame (h, w, 3), text_feat (1024,)
 Output: bbox [x, y, w, h]
 
-1. Point → Mask: SAM2.predict_masks(frame, [region_point])
-   Returns: list of mask proposals (typically 2–5 masks)
+1. Grounding DINO -> initial bbox and center point
+2. SAM2 point prompt (bbox center) -> refined mask proposals
+3. Filter masks by size, score with CLIP
+4. Best mask -> final bbox
 
-2. Filter by size:
-   min_area = 0.001 × h × w  (0.1% of frame)
-   max_area = 0.12 × h × w   (12% of frame, or 0.6 for large objects)
-   valid_masks = [m for m in masks if min_area ≤ area(m) ≤ max_area]
-
-3. Score each mask with CLIP:
-   For each valid mask:
-     bbox_candidate = mask_to_bbox(mask)
-     crop = frame[y1:y2, x1:x2]
-     crop_feat = clip_model.encode_image(preprocess(crop))
-     score = crop_feat @ text_feat
-
-4. Select best:
-   best_mask = masks[argmax(scores)]
-   bbox = mask_to_bbox(best_mask)
-
-Time: O(1) FAISS + O(50–120s) SAM2 + O(5ms) CLIP scoring
-Use: Offline evaluation, maximum accuracy (92% mIoU)
+Time: ~200ms GDino + 20-60s SAM2
+Use: Offline evaluation, maximum accuracy
 ```
 
 #### OCR Fusion for Brand Queries
@@ -603,24 +592,21 @@ Else:
 
 #### Design Decisions
 
-1. **Lazy REN Loading**: REN only loads on first query (not during indexing) to preserve ~3–4 GB VRAM during `prepare_index.py`. See `TextQueryLocalizer.ren` property.
+1. **Grounding DINO over REN+CLIP** (v2): The original approach used REN's 32x32 grid as spatial proposals, then scored crops with CLIP. This was the wrong tool — CLIP encodes semantic meaning, not spatial precision. Grounding DINO is purpose-built for text-conditioned detection and outputs bboxes directly. No embedding bridge or trained adapter needed.
 
-2. **Grid Point Scaling**: REN's grid_points are in 518×518 normalized space. Scaling to frame dimensions:
-   ```python
-   scale_y = frame_height / 518.0
-   scale_x = frame_width / 518.0
-   frame_point = (int(grid_y * scale_y), int(grid_x * scale_x))
-   ```
+2. **CLIP Patch Tokens for Re-ranking** (v2): FAISS retrieval uses CLS tokens (whole-frame), which dilute small objects. CLIP's 256 patch tokens are projected to the same 1024-dim joint space as text via `visual.ln_post @ visual.proj`, enabling direct text-to-patch comparison. The 40/60 CLS/patch blend was chosen empirically.
 
-3. **Stride Sampling**: Using stride=4 on the 32×32 grid gives 256 proposals instead of 1024, reducing per-query compute from ~500ms to ~100ms with <1% accuracy loss.
+3. **Adaptive Threshold** (v2): Different queries have vastly different similarity distributions ("fork" max=0.26 vs "pink flower" max=0.16). A fixed threshold fails for both. Per-query `tau = mean + alpha * std` adapts automatically.
 
-4. **Context Window**: Fast eval uses `context_seconds: 0.5` (0.5s = ~30 frames at 60fps) instead of 5.0s. This reduces export I/O from 600 frames to 30, dropping per-query time by ~80%.
+4. **GDino+CLIP Frame Verification** (v2): Grounding DINO alone can confuse visually similar objects (red bucket matched as "pink flower in a pot" due to color). Adding CLIP crop verification (score >= 0.17) filters these false positives by checking semantic match, not just detection confidence.
 
-5. **OCR Separate Path**: OCR score is never mixed with CLIP score during retrieval (different scales, different semantics). OCR path is only used when `_is_brand_query()` returns True.
+5. **Lazy Model Loading**: Both Grounding DINO and REN load on first use (not during indexing) to preserve VRAM. GDino offloads to CPU when not in use.
 
-6. **Temporal Segmentation Gap**: Segments separated by >2 seconds are treated as independent occurrences. This prevents merging of distinct uses of the same object.
+6. **OCR Separate Path**: OCR score is never mixed with CLIP score during retrieval (different scales, different semantics). OCR path is only used when `_is_brand_query()` returns True.
 
-7. **Feature Space**: CLIP ViT-g-14 provides the joint embedding space for both text and spatial crops. No adapter between CLIP and REN spaces — REN grid is merely spatial proposals, scoring happens in CLIP space.
+7. **Temporal Segmentation Gap**: Segments separated by >2 seconds are treated as independent occurrences. This prevents merging of distinct uses of the same object.
+
+8. **All Toggleable**: Every v2 feature is controlled by config flags (`adaptive_threshold`, `spatial_method`, `use_patch_rerank`). Legacy behavior preserved as fallback.
 
 #### Reproducibility
 
@@ -688,10 +674,11 @@ Results on EPIC-KITCHENS P01–P05 (5 videos, 50 total queries: 25 OCR + 25 gene
 | full_sam2 | 0.75 | 35s | 4.8 GB |
 
 **Key Insights:**
-- Temporal segmentation accounts for ~4% mIoU improvement (0.71 → 0.75)
-- REN grid outperforms uniform 3×3 grid by ~3% on spatial accuracy
+- Temporal segmentation accounts for ~4% mIoU improvement (0.71 -> 0.75)
+- Grounding DINO (v2) provides more accurate spatial localization than REN grid + CLIP crops
+- Patch re-ranking (v2) improves retrieval for small/specific objects over CLS-only
+- GDino+CLIP frame verification (v2) filters color/shape confusion false positives
 - OCR contributes ~3% improvement for brand/label queries, 0% for general objects
-- Fast path trades 7% accuracy for 7× speedup (useful for interactive scenarios)
 
 ---
 
