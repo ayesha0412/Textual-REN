@@ -1,0 +1,94 @@
+data:
+  sam2_ckpt: '../checkpoints/sam2.1_hiera_large.pt'
+
+text_query:
+  similarity_threshold: 0.18   # CLIP cosine similarity cutoff for candidate frames
+  context_seconds: 0.5          # ±N/2 seconds temporal window for Stage 4
+  frame_sample_rate: 10         # process every Nth frame for CLIP retrieval (1 = all)
+  min_crop_verify: 0.17         # min CLIP crop score to accept a candidate frame as valid
+  neg_weight: 0.25              # weight for negative prompts (0 = disabled)
+  # If the final segment is weak, fall back to the strongest segment instead.
+  last_segment_min_peak: 0.18   # absolute min peak to trust the last segment (= threshold)
+  last_segment_min_rel: 0.60    # or relative to global peak (last >= rel * global)
+  tracker_name: 'sam2'
+  tracker_param: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+  patch_size: 8                 # feature patch size for SAM-pooled tokens (DINO)
+  save_dir: 'logs/'
+
+  # RELOCATE Stage 3: Selection Policy
+  selection_policy: "last"      # "last", "strongest", "topk", "topp"
+  selection_top_k: 10           # For topk/topp mode
+  selection_top_p: 0.9          # Nucleus sampling threshold
+  nms_threshold: 0.5            # Inter-frame NMS: suppress within 0.5s
+  nms_window: null              # Or: group frames in windows (null = threshold-based NMS)
+
+  # RELOCATE Stage 5: Multi-Candidate Refinement
+  max_candidates_to_refine: 5   # Beam search width for refinement
+
+  # SAM2 settings
+  sam_inference_size: 512       # 1024 = full quality, 768/512 = faster with similar masks
+  skip_sam2_eval: true          # fast mode — use GDino bbox directly
+  cache_sam_results: true
+
+  # Spatial localization method for Stage 5 (bbox detection)
+  # "grounding_dino" — text-conditioned detection, training-free (recommended)
+  # "ren_clip"        — REN grid proposals + CLIP crop scoring (legacy)
+  spatial_method: "grounding_dino"
+
+  # Adaptive threshold: compute τ per-query from similarity distribution
+  adaptive_threshold: true
+  threshold_alpha: 1.0            # τ = μ + α·σ, clamped to [0.10, 0.30]
+
+  # FAISS indexing parameters
+  faiss:
+    clip_dim: 1024                # ViT-g-14 output dim
+    top_k: 100
+    index_type: 'flat'
+    use_patch_rerank: true        # re-rank top-k using CLIP patch tokens
+    patch_top_k: 100              # how many CLS candidates to re-rank with patches
+
+# Grounding DINO — text-conditioned open-vocabulary object detection
+grounding_dino:
+  model_id: 'IDEA-Research/grounding-dino-tiny'
+  box_threshold: 0.20
+  text_threshold: 0.20
+
+ren:
+  pretrained:
+    feature_extractors:
+      - 'dinov2_vitl14'
+    patch_sizes:
+      - 14
+    region_extractor: 'sam2_hierra'
+    sam2_hieral_ckpt: '../checkpoints/sam2.1_hiera_large.pt'
+    sam2_hieral_config: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+
+  architecture:
+    grid_size: 32
+    hidden_dim: 1024
+    decoder_layers: 4
+    num_attention_heads: 8
+
+  parameters:
+    image_resolution: 518
+    batch_size: 16
+    learning_rate: 0.001
+    num_epochs: 50
+    max_prompts: 256
+    accumulation_steps: 1
+    warmup_steps: 100
+    logging_steps: 25
+    max_grad_norm: 5.0
+    upsample_features: False
+    deduplicate_masks: False
+    num_workers: 16
+    feature_extractor: 'dinov2_vitl14'
+    grid_size: 32
+    use_slic: False
+    aggregate_tokens: False
+    token_variant: 'default'
+    ren_ckpt: './logs/ren-dinov2-vitl14/checkpoint.pth'
+
+  logging:
+    save_dir: '../logs/'
+    exp_name: 'ren-dinov2-vitl14'
