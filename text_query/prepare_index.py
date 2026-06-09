@@ -153,7 +153,7 @@ class VideoIndexer:
         n_sampled = max(1, total_frames // sample_rate)
         print(f"  Source  : {total_frames} frames @ {fps:.2f} fps  "
               f"({frame_width}×{frame_height})")
-        print(f"  Sampling: every {sample_rate}th frame → ~{n_sampled} frames")
+        print(f"  Sampling: every {sample_rate}th frame -> ~{n_sampled} frames")
         print(f"  CLIP batch size : {self.CLIP_BATCH_SIZE}")
 
         do_ocr = not skip_ocr and HAS_OCR
@@ -172,8 +172,11 @@ class VideoIndexer:
                 print("  EasyOCR ready.")
 
         clip_embeddings   = []   # will hold (N, D) float32
+        patch_embeddings  = []   # will hold (N, 256, D) float32
         frame_metadata    = []
         all_region_tokens = []
+
+        do_patches = self.config.get('text_query', {}).get('faiss', {}).get('use_patch_rerank', True)
 
         # ── accumulation buffers for CLIP batching ──────────────────────────
         batch_frames: List[np.ndarray] = []   # BGR frames pending CLIP
@@ -208,6 +211,9 @@ class VideoIndexer:
                 if len(batch_frames) >= self.CLIP_BATCH_SIZE:
                     feats = self._extract_clip_batch(batch_frames)
                     clip_embeddings.append(feats)
+                    if do_patches:
+                        patches = self._extract_patch_tokens_batch(batch_frames)
+                        patch_embeddings.append(patches)
                     frame_metadata.extend(batch_meta)
                     pct = 100 * sampled_frame_idx / max(n_sampled, 1)
                     print(f"  [{pct:5.1f}%] frame {raw_frame_idx}/{total_frames}  "
@@ -223,6 +229,9 @@ class VideoIndexer:
         if batch_frames:
             feats = self._extract_clip_batch(batch_frames)
             clip_embeddings.append(feats)
+            if do_patches:
+                patches = self._extract_patch_tokens_batch(batch_frames)
+                patch_embeddings.append(patches)
             frame_metadata.extend(batch_meta)
 
         cap.release()
@@ -286,12 +295,21 @@ class VideoIndexer:
                 pickle.dump(all_region_tokens, f)
         np.save(embeddings_path, clip_embeddings)
 
+        patch_emb_path = os.path.join(output_dir, 'patch_embeddings.npy')
+        if do_patches and patch_embeddings:
+            patch_embeddings_np = np.concatenate(patch_embeddings, axis=0)  # (N, 256, 1024)
+            np.save(patch_emb_path, patch_embeddings_np)
+            size_mb = patch_embeddings_np.nbytes / (1024 * 1024)
+            print(f"  Patch embeddings: {patch_embeddings_np.shape} ({size_mb:.0f} MB)")
+
         print(f"Index saved to: {output_dir}")
         print(f"  - FAISS index: {index_path}")
         print(f"  - Metadata: {metadata_path}")
         if not skip_ren:
             print(f"  - Region tokens: {regions_path}")
         print(f"  - CLIP embeddings: {embeddings_path}")
+        if do_patches and patch_embeddings:
+            print(f"  - Patch embeddings: {patch_emb_path}")
 
         return {
             'index_path': index_path,
@@ -345,6 +363,37 @@ class VideoIndexer:
 
         feats = torch.nn.functional.normalize(feats, p=2, dim=-1)
         return feats.cpu().numpy().astype(np.float32)
+
+    def _extract_patch_tokens_batch(self, frames: List[np.ndarray]) -> np.ndarray:
+        """
+        Extract CLIP patch tokens for a batch of BGR frames.
+
+        Each frame produces 256 patch tokens of dim 1024 (projected to joint space).
+        Ported from model.py:extract_openclip() pattern.
+
+        Returns:
+            (len(frames), 256, 1024) float32 array of L2-normalised patch tokens
+        """
+        imgs = torch.stack([
+            self.localizer.clip_preprocess(
+                Image.fromarray(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
+            )
+            for f in frames
+        ]).to(self.device)
+
+        visual = self.localizer.clip_model.visual
+
+        with torch.no_grad(), torch.autocast(
+            self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
+        ):
+            out = visual.forward_intermediates(
+                imgs, indices=[-1], intermediates_only=False, output_fmt='NLC'
+            )
+            patches = out['image_intermediates'][-1].float()  # (B, 256, 1408)
+            patches = visual.ln_post(patches) @ visual.proj.float()  # (B, 256, 1024)
+
+        patches = torch.nn.functional.normalize(patches, p=2, dim=-1)
+        return patches.float().cpu().numpy()
 
     def _extract_region_tokens(self, frame: np.ndarray) -> torch.Tensor:
         """

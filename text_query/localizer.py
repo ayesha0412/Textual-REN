@@ -154,6 +154,16 @@ class TextQueryLocalizer:
         best_idx = max(last_segment, key=lambda i: sims[i])
         return int(best_idx), float(sims[best_idx]), sims
 
+    @staticmethod
+    def adaptive_threshold(sims, alpha: float = 1.0,
+                           min_tau: float = 0.10, max_tau: float = 0.30) -> float:
+        """Compute query-conditioned threshold from the similarity distribution."""
+        if isinstance(sims, torch.Tensor):
+            sims = sims.numpy()
+        mu = float(sims.mean())
+        sigma = float(sims.std())
+        return float(np.clip(mu + alpha * sigma, min_tau, max_tau))
+
     # ------------------------------------------------------------------ #
     # Region localization (REN + CLIP bridge)                             #
     # ------------------------------------------------------------------ #

@@ -38,20 +38,34 @@ text_query:
   cache_sam_results: true       # if true, cache SAM2 results per frame
   use_fast_tokens: false        # if true, use simplified token generation (faster but less accurate)
 
+  # Spatial localization method for Stage 5 (bbox detection)
+  # "grounding_dino" — text-conditioned detection, training-free (recommended)
+  # "ren_clip"        — REN grid proposals + CLIP crop scoring (legacy)
+  spatial_method: "grounding_dino"
+
+  # Adaptive threshold: compute τ per-query from similarity distribution
+  adaptive_threshold: true
+  threshold_alpha: 1.0            # τ = μ + α·σ, clamped to [0.10, 0.30]
+
   # FAISS indexing parameters
   faiss:
-    # CLIP embedding dimension (OpenCLIP ViT-g-14)
-    clip_dim: 1024    # ViT-g-14 output dim
-    # Number of FAISS candidates to refine during query (higher = slower but more accurate)
+    clip_dim: 1024                # ViT-g-14 output dim
     top_k: 100
-    # Index type: 'flat' (exact) or 'ivf' (approximate, faster)
     index_type: 'flat'
+    use_patch_rerank: true        # re-rank top-k using CLIP patch tokens
+    patch_top_k: 100              # how many CLS candidates to re-rank with patches
 
   # Text-Region Adapter (bridges CLIP → REN space)
   adapter:
-    input_dim: 1024    # CLIP text embedding dimension (ViT-g-14 = 1024, ViT-G-14 = 1280)
-    output_dim: 1024   # REN region token dimension
-    temperature: 0.1   # Softmax temperature for scoring
+    input_dim: 1024
+    output_dim: 1024
+    temperature: 0.1
+
+# Grounding DINO — text-conditioned open-vocabulary object detection
+grounding_dino:
+  model_id: 'IDEA-Research/grounding-dino-tiny'
+  box_threshold: 0.20            # lower to get more candidates for CLIP re-ranking
+  text_threshold: 0.20           # lower to get more candidates for CLIP re-ranking
 
 ren:
   pretrained:

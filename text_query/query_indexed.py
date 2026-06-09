@@ -36,7 +36,7 @@ try:
     HAS_RAPIDFUZZ = True
 except ImportError:
     HAS_RAPIDFUZZ = False
-    print("Warning: rapidfuzz not installed — OCR fusion disabled.")
+    print("Warning: rapidfuzz not installed -- OCR fusion disabled.")
     print("  pip install rapidfuzz")
 
 try:
@@ -60,6 +60,7 @@ except ImportError:
     sys.exit(1)
 
 from localizer import TextQueryLocalizer
+from grounding_dino import GroundingDINOLocalizer
 
 
 # ====================================================================== #
@@ -207,7 +208,7 @@ class SelectionPolicy:
 
         # Apply selection policy
         if self.policy_name == 'last':
-            result = candidates[:1]  # Just the last segment's peak
+            result = candidates  # All peaks, recent-first; caller picks verified best
         elif self.policy_name == 'strongest':
             best = max(candidates, key=lambda x: x['similarity'])
             result = [best]
@@ -227,45 +228,67 @@ class SelectionPolicy:
 # Adapted from visual_query/models.py CandidateRefiner                    #
 
 class CandidateRefiner:
-    """RELOCATE Stage 5: Refine multiple candidates with REN + SAM2."""
+    """RELOCATE Stage 5: Refine multiple candidates with spatial localization."""
 
-    def __init__(self, query_engine, config: Dict):
+    def __init__(self, query_engine, config: Dict, text_query: str = ""):
         self.query_engine = query_engine
         self.config = config
+        self.text_query = text_query
         self.max_candidates = config.get('text_query', {}).get('max_candidates_to_refine', 5)
         self.skip_sam2 = config.get('text_query', {}).get('skip_sam2_eval', True)
+        self.spatial_method = config.get('text_query', {}).get('spatial_method', 'grounding_dino')
+
+    def _localize_grounding_dino(self, frame_rgb, text_feat, h, w):
+        """Use Grounding DINO for direct text->bbox detection, CLIP re-ranks ties."""
+        gdino_cfg = self.config.get('grounding_dino', {})
+        result = self.query_engine.grounding_dino.best_box(
+            frame_rgb, self.text_query,
+            box_threshold=gdino_cfg.get('box_threshold', 0.30),
+            text_threshold=gdino_cfg.get('text_threshold', 0.25),
+            clip_model=self.query_engine.localizer.clip_model,
+            clip_preprocess=self.query_engine.localizer.clip_preprocess,
+            text_feat=text_feat,
+        )
+        if result is not None:
+            bbox, score = result
+            cx = bbox[0] + bbox[2] // 2
+            cy = bbox[1] + bbox[3] // 2
+            return (cx, cy), score, bbox
+        return (w // 2, h // 2), 0.0, None
+
+    def _localize_ren_clip(self, frame_rgb, text_feat, h, w):
+        """Legacy: REN grid proposals scored with CLIP crops."""
+        try:
+            region_point, region_score = self.query_engine._ren_guided_localize(frame_rgb, text_feat)
+            return region_point, region_score, None
+        except Exception as e:
+            print(f"  REN localization failed: {e}")
+            return (w // 2, h // 2), 0.0, None
 
     def refine(self, selected_candidates, frames, frame_indices, text_feat):
         """
-        Refine top-K candidates using REN-guided spatial localization + SAM2.
+        Refine top-K candidates using spatial localization.
 
-        Input:
-            selected_candidates: list of {'frame_idx', 'similarity', ...}
-            frames: list of np.ndarray (loaded video frames)
-            frame_indices: list of int (frame indices for each frame)
-            text_feat: torch.Tensor (1, 1024) - CLIP text embedding
-
-        Output:
-            list of refined candidates sorted by refined_score
+        spatial_method controls the localizer:
+          - "grounding_dino": text-conditioned detection (default, training-free)
+          - "ren_clip": REN grid proposals + CLIP crop scoring (legacy)
         """
         refined = []
         h, w = frames[0].shape[:2] if frames else (0, 0)
+        method = self.spatial_method
 
-        # Try to use REN; fall back to CLIP-tile if REN fails
-        use_ren = True
-        try:
-            _ = self.query_engine.localizer.ren  # Try to load REN
-        except SystemExit:
-            print("  REN checkpoint failed to load; falling back to CLIP-tile path")
-            use_ren = False
-        except Exception as e:
-            print(f"  REN loading failed ({e}); falling back to CLIP-tile path")
-            use_ren = False
+        if method == 'ren_clip':
+            try:
+                _ = self.query_engine.localizer.ren
+            except Exception as e:
+                print(f"  REN loading failed ({e}); falling back to grounding_dino")
+                method = 'grounding_dino'
+
+        print(f"  Spatial method: {method}")
 
         for cand in selected_candidates[:self.max_candidates]:
             frame_idx = cand['frame_idx']
 
-            # Find frame in temporal window
             try:
                 local_idx = frame_indices.index(frame_idx)
                 frame_rgb = frames[local_idx]
@@ -273,33 +296,26 @@ class CandidateRefiner:
                 print(f"  Warning: frame {frame_idx} not in context window, skipping")
                 continue
 
-            # Stage 5a: REN-guided spatial localization (with fallback)
-            if use_ren:
-                try:
-                    region_point, region_score = self.query_engine._ren_guided_localize(frame_rgb, text_feat)
-                except Exception as e:
-                    print(f"  REN localization failed for frame {frame_idx}: {e}, using CLIP-tile fallback")
-                    region_point = (w // 2, h // 2)
-                    region_score = 0.0
+            # Spatial localization
+            if method == 'grounding_dino':
+                region_point, region_score, gdino_bbox = self._localize_grounding_dino(frame_rgb, text_feat, h, w)
             else:
-                # CLIP-tile fallback: use frame center
-                region_point = (w // 2, h // 2)
-                region_score = 0.0
+                region_point, region_score, gdino_bbox = self._localize_ren_clip(frame_rgb, text_feat, h, w)
 
-            # Stage 5b: SAM2 point → bbox
-            if self.skip_sam2:
-                # CLIP-tile fast path
+            # Bbox: use Grounding DINO bbox directly if available
+            if gdino_bbox is not None:
+                bbox = gdino_bbox
+            elif self.skip_sam2:
                 bbox_width = max(64, w // 4)
                 bbox_height = max(64, h // 4)
                 x_min = max(0, region_point[0] - bbox_width // 2)
                 y_min = max(0, region_point[1] - bbox_height // 2)
                 bbox = [x_min, y_min, bbox_width, bbox_height]
             else:
-                # SAM2 accurate path
                 try:
                     bbox_tensor = self.query_engine.localizer.point_to_bbox(
                         frame_rgb,
-                        np.array([region_point[1], region_point[0]]),  # SAM2 uses (y, x)
+                        np.array([region_point[1], region_point[0]]),
                         text_feat,
                         inference_size=self.config.get('text_query', {}).get('sam_inference_size', 512)
                     )
@@ -320,7 +336,6 @@ class CandidateRefiner:
                 'refined_score': region_score
             })
 
-        # Sort by refined score (descending)
         refined.sort(key=lambda x: x['refined_score'], reverse=True)
         return refined
 
@@ -338,6 +353,7 @@ class IndexedQueryEngine:
             self.gpu_resources = faiss.StandardGpuResources()
 
         self._ocr_reader = None   # lazily initialized for query-time OCR bbox
+        self._grounding_dino = None  # lazily initialized for spatial localization
 
         self.index_dir = index_dir
         self._load_index()
@@ -369,9 +385,28 @@ class IndexedQueryEngine:
         # L2-normalised CLIP image embeddings, shape (N, D).  ~12 MB at sample_rate=10.
         self.clip_embeddings = np.load(embeddings_path)
 
+        # Patch-level embeddings for re-ranking (optional, from prepare_index.py)
+        patch_path = os.path.join(self.index_dir, 'patch_embeddings.npy')
+        use_patches = self.config.get('text_query', {}).get('faiss', {}).get('use_patch_rerank', True)
+        if use_patches and os.path.exists(patch_path):
+            self.patch_embeddings = np.load(patch_path)  # (N, 256, 1024)
+            print(f"  Patch embeddings loaded: {self.patch_embeddings.shape}")
+        else:
+            self.patch_embeddings = None
+
         print(f"  Loaded {self.faiss_index.ntotal} frames  (d={self.faiss_index.d})")
         print(f"  FPS: {self.metadata['fps']}")
         print(f"  Total video frames: {self.metadata['total_frames']}")
+
+    @property
+    def grounding_dino(self) -> GroundingDINOLocalizer:
+        if self._grounding_dino is None:
+            gdino_cfg = self.config.get('grounding_dino', {})
+            self._grounding_dino = GroundingDINOLocalizer(
+                model_id=gdino_cfg.get('model_id', 'IDEA-Research/grounding-dino-tiny'),
+                device=self.device,
+            )
+        return self._grounding_dino
 
     # ------------------------------------------------------------------ #
     # Main query                                                           #
@@ -456,10 +491,10 @@ class IndexedQueryEngine:
             noun_useful = noun_signal >= threshold
             if noun_useful:
                 clip_sims = (0.7 * sub_sims_list[0] + 0.3 * noun_sims).astype(np.float32)
-                print(f"  Compositional: active — noun '{sub_queries[1]}' max={noun_signal:.3f}")
+                print(f"  Compositional: active -- noun '{sub_queries[1]}' max={noun_signal:.3f}")
             else:
                 clip_sims = sub_sims_list[0]
-                print(f"  Compositional: skipped — noun '{sub_queries[1]}' signal too weak "
+                print(f"  Compositional: skipped -- noun '{sub_queries[1]}' signal too weak "
                       f"({noun_signal:.3f} < {threshold}), using full query only")
 
         # ---- Step 2a: optional negative query suppression ----
@@ -476,7 +511,7 @@ class IndexedQueryEngine:
         # Brand queries  ("Yorkshire Tea", "Twinings") → OCR fusion + OCR bbox.
         # Object queries ("knife", "keys", "fork")     → pure CLIP, OCR skipped.
         is_brand = self._is_brand_query(text_query) and not ablation_no_ocr
-        print(f"  Query type: {'BRAND/TEXT — OCR fusion enabled' if is_brand else 'OBJECT — pure CLIP (OCR skipped)'}")
+        print(f"  Query type: {'BRAND/TEXT -- OCR fusion enabled' if is_brand else 'OBJECT -- pure CLIP (OCR skipped)'}")
 
         if is_brand:
             ocr_scores = self._compute_ocr_scores(text_query, frame_metadata, window=2)
@@ -486,17 +521,32 @@ class IndexedQueryEngine:
             n_ocr_hits = int((ocr_scores >= 0.85).sum())
             if n_ocr_hits > 0:
                 print(f"  OCR hits (≥0.85 match): {n_ocr_hits}/{len(ocr_scores)} frames")
-                print(f"  OCR weight: {ocr_weight}  (fused = CLIP + {ocr_weight} × OCR)")
+                print(f"  OCR weight: {ocr_weight}  (fused = CLIP + {ocr_weight} * OCR)")
             else:
-                print(f"  OCR: index has no clear text match — falling back to CLIP only")
+                print(f"  OCR: index has no clear text match -- falling back to CLIP only")
         else:
             ocr_scores = np.zeros(len(frame_metadata), dtype=np.float32)
             n_ocr_hits = 0
 
+        # ---- Step 2c: patch-level re-ranking ----
+        if self.patch_embeddings is not None:
+            clip_sims = self._patch_rerank(text_np, clip_sims)
+            print(f"  Patch re-ranking: applied (top-{self.config.get('text_query', {}).get('faiss', {}).get('patch_top_k', 100)} frames)")
+
         all_sims = clip_sims + ocr_weight * ocr_scores
 
+        # ---- Step 2d: adaptive threshold ----
+        use_adaptive = self.config.get('text_query', {}).get('adaptive_threshold', False)
+        if use_adaptive:
+            alpha = self.config.get('text_query', {}).get('threshold_alpha', 1.0)
+            adaptive_tau = self._adaptive_threshold(all_sims, alpha=alpha)
+            print(f"  Adaptive threshold: tau={adaptive_tau:.4f} (alpha={alpha}, "
+                  f"mean={all_sims.mean():.4f}, std={all_sims.std():.4f}, "
+                  f"fixed was {threshold})")
+            threshold = adaptive_tau
+
         n_above = int((all_sims >= threshold).sum())
-        print(f"\n  Fused scores — max={all_sims.max():.4f}  "
+        print(f"\n  Fused scores -- max={all_sims.max():.4f}  "
               f"mean={all_sims.mean():.4f}  "
               f"above {threshold}: {n_above}/{len(all_sims)}")
 
@@ -516,7 +566,75 @@ class IndexedQueryEngine:
 
         print(f"  {num_valid_segments} segment(s) found, {len(selected_candidates)} candidate(s) selected (policy={selection_policy.policy_name})")
 
-        # For backwards-compatibility with ablations, pick the first/best candidate
+        # ---- Stage 3b: Grounding DINO + CLIP verified frame selection ----
+        # GDino alone can confuse visually similar objects (red bucket -> "pink
+        # flower in a pot"). For each candidate, run GDino then CLIP-score the
+        # best crop against the text query. Accept only if CLIP crop score
+        # exceeds min_crop_verify — this filters color/shape confusion.
+        spatial_method = self.config.get('text_query', {}).get('spatial_method', 'grounding_dino')
+        if spatial_method == 'grounding_dino' and len(selected_candidates) > 1:
+            gdino_cfg = self.config.get('grounding_dino', {})
+            box_thresh = gdino_cfg.get('box_threshold', 0.20)
+            text_thresh = gdino_cfg.get('text_threshold', 0.20)
+            min_clip_crop = self.config.get('text_query', {}).get('min_crop_verify', 0.17)
+            max_verify = min(len(selected_candidates), 8)
+
+            print(f"\n  Verifying up to {max_verify} candidates with GDino+CLIP "
+                  f"(min_crop={min_clip_crop})...")
+            verified_idx = None
+            best_unverified = (None, -1.0)  # (idx, clip_score) fallback
+            for ci, cand in enumerate(selected_candidates[:max_verify]):
+                fidx = cand['frame_idx']
+                try:
+                    probe = self._load_single_frame(video_path, fidx)
+                except Exception:
+                    continue
+                result = self.grounding_dino.best_box(
+                    probe, text_query,
+                    box_threshold=box_thresh, text_threshold=text_thresh,
+                    clip_model=self.localizer.clip_model,
+                    clip_preprocess=self.localizer.clip_preprocess,
+                    text_feat=text_feat,
+                )
+                if result is None:
+                    print(f"    candidate {ci}: frame {fidx} "
+                          f"(t={fidx/fps:.1f}s) -- no detection")
+                    continue
+                bbox, clip_score = result
+                if clip_score >= min_clip_crop:
+                    print(f"    candidate {ci}: frame {fidx} "
+                          f"(t={fidx/fps:.1f}s) -- CLIP crop={clip_score:.3f} >= "
+                          f"{min_clip_crop} VERIFIED")
+                    verified_idx = ci
+                    break
+                else:
+                    print(f"    candidate {ci}: frame {fidx} "
+                          f"(t={fidx/fps:.1f}s) -- CLIP crop={clip_score:.3f} < "
+                          f"{min_clip_crop} (color/shape confusion?)")
+                    if clip_score > best_unverified[1]:
+                        best_unverified = (ci, clip_score)
+
+            if verified_idx is not None and verified_idx != 0:
+                old_frame = selected_candidates[0]['frame_idx']
+                selected_candidates = [selected_candidates[verified_idx]] + \
+                    [c for i, c in enumerate(selected_candidates) if i != verified_idx]
+                print(f"  Verified: frame {selected_candidates[0]['frame_idx']} "
+                      f"(was {old_frame})")
+            elif verified_idx is None and best_unverified[0] is not None:
+                bi = best_unverified[0]
+                if bi != 0:
+                    old_frame = selected_candidates[0]['frame_idx']
+                    selected_candidates = [selected_candidates[bi]] + \
+                        [c for i, c in enumerate(selected_candidates) if i != bi]
+                    print(f"  No frame passed CLIP threshold; using best "
+                          f"({best_unverified[1]:.3f}): frame "
+                          f"{selected_candidates[0]['frame_idx']} (was {old_frame})")
+                else:
+                    print(f"  No frame passed CLIP threshold; keeping original "
+                          f"(best CLIP={best_unverified[1]:.3f})")
+            elif verified_idx is None:
+                print(f"  GDino found nothing on any candidate; keeping original")
+
         best_candidate = selected_candidates[0]
         last_frame_idx = best_candidate['frame_idx']
         last_sim = best_candidate['similarity']
@@ -529,7 +647,7 @@ class IndexedQueryEngine:
                     last_meta_idx = i
                     break
 
-        print(f"\n  Best candidate → frame {last_frame_idx}  "
+        print(f"\n  Best candidate -> frame {last_frame_idx}  "
               f"(t={last_frame_idx/fps:.2f}s, sim={last_sim:.3f})")
 
         # ========================================================================= #
@@ -544,9 +662,9 @@ class IndexedQueryEngine:
         center_local = frame_indices.index(last_frame_idx) if last_frame_idx in frame_indices else 0
 
         # ========================================================================= #
-        # STAGE 5: Multi-Candidate REN Refinement (spatial localization)           #
+        # STAGE 5: Spatial Localization (Grounding DINO or legacy REN+CLIP)       #
         # ========================================================================= #
-        refiner = CandidateRefiner(self, self.config)
+        refiner = CandidateRefiner(self, self.config, text_query=text_query)
         refined_candidates = refiner.refine(selected_candidates, frames, frame_indices, text_feat)
 
         if refined_candidates:
@@ -568,7 +686,8 @@ class IndexedQueryEngine:
             else:
                 raise RuntimeError("No frames loaded in temporal window")
 
-        print(f"  Spatial location (REN-guided): {region_point}  score={region_score:.3f}")
+        spatial_method = self.config.get('text_query', {}).get('spatial_method', 'grounding_dino')
+        print(f"  Spatial location ({spatial_method}): {region_point}  score={region_score:.3f}")
 
         # ---- Stage 5b: bbox generation (OCR direct, CLIP-tile fast path, or SAM2) ----
         _skip_sam2 = self.config['text_query'].get('skip_sam2_eval', True)
@@ -578,7 +697,7 @@ class IndexedQueryEngine:
         last_ocr_score = float(ocr_scores[last_meta_idx]) if last_meta_idx < len(ocr_scores) else 0.0
 
         if is_brand and last_ocr_score >= 0.85 and HAS_EASYOCR:
-            print(f"\nOCR score high ({last_ocr_score:.2f}) — locating brand bbox...")
+            print(f"\nOCR score high ({last_ocr_score:.2f}) -- locating brand bbox...")
             # Try to get OCR bbox from the best frame
             try:
                 frame_rgb = frames[center_local]
@@ -592,11 +711,11 @@ class IndexedQueryEngine:
         # Use OCR bbox if available, otherwise use REN-refined bbox
         if ocr_bbox_xywh is not None:
             bbox = torch.tensor(ocr_bbox_xywh)
-            print(f"SAM2 skipped — using OCR bbox: {bbox.tolist()}")
+            print(f"SAM2 skipped -- using OCR bbox: {bbox.tolist()}")
         else:
             bbox = torch.tensor(bbox_from_refiner, dtype=torch.int32)
             if _skip_sam2:
-                print(f"SAM2 skipped (skip_sam2_eval=true) — REN-refined bbox: {bbox.tolist()}")
+                print(f"SAM2 skipped (skip_sam2_eval=true) -- refined bbox: {bbox.tolist()}")
             else:
                 print(f"SAM2 will refine REN bbox: {bbox.tolist()}")
 
@@ -716,7 +835,7 @@ class IndexedQueryEngine:
 
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
         print(f"  OCR bbox: '{best_det[1]}' conf={best_det[2]:.2f} "
-              f"match={best_score:.2f} → [{x1},{y1},{x2-x1},{y2-y1}]")
+              f"match={best_score:.2f} -> [{x1},{y1},{x2-x1},{y2-y1}]")
         return (cx, cy), [x1, y1, x2 - x1, y2 - y1]
 
     # ------------------------------------------------------------------ #
@@ -936,6 +1055,54 @@ class IndexedQueryEngine:
             scores[i] = score
 
         return scores
+
+    # ------------------------------------------------------------------ #
+    # Adaptive threshold                                                   #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _adaptive_threshold(sims: np.ndarray, alpha: float = 1.0,
+                            min_tau: float = 0.10, max_tau: float = 0.30) -> float:
+        """Compute query-conditioned threshold from the similarity distribution."""
+        mu = float(sims.mean())
+        sigma = float(sims.std())
+        return float(np.clip(mu + alpha * sigma, min_tau, max_tau))
+
+    # ------------------------------------------------------------------ #
+    # Patch-level re-ranking                                               #
+    # ------------------------------------------------------------------ #
+
+    def _patch_rerank(self, text_feat: np.ndarray, clip_sims: np.ndarray) -> np.ndarray:
+        """
+        Re-rank frame similarities using max-patch scoring.
+
+        For each frame, compute max_i(cos(text, patch_i)) — the strongest
+        local patch signal — and blend it with the CLS score.
+
+        Args:
+            text_feat: (1, D) L2-normalized text embedding
+            clip_sims: (N,) CLS-based similarities for all frames
+
+        Returns:
+            (N,) re-ranked similarity scores
+        """
+        if self.patch_embeddings is None:
+            return clip_sims
+
+        top_k = self.config.get('text_query', {}).get('faiss', {}).get('patch_top_k', 100)
+        top_indices = np.argsort(clip_sims)[::-1][:top_k]
+
+        reranked = clip_sims.copy()
+        for idx in top_indices:
+            if idx >= len(self.patch_embeddings):
+                continue
+            patches = self.patch_embeddings[idx]       # (256, 1024)
+            patch_sims = patches @ text_feat.T         # (256, 1)
+            max_patch = float(patch_sims.max())
+            # Blend: 40% CLS + 60% max-patch (patch is more discriminative for small objects)
+            reranked[idx] = 0.4 * clip_sims[idx] + 0.6 * max_patch
+
+        return reranked
 
     # ------------------------------------------------------------------ #
     # CLIP crop scoring                                                    #
