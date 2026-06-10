@@ -114,6 +114,7 @@ class VideoIndexer:
 
         clip_embeddings   = []
         patch_embeddings  = []
+        blur_scores       = []
         frame_metadata    = []
 
         do_patches = self.config.get('text_query', {}).get('faiss', {}).get('use_patch_rerank', True)
@@ -132,13 +133,19 @@ class VideoIndexer:
                 break
 
             if raw_frame_idx % sample_rate == 0:
+                # Compute blur score (Laplacian variance) — cheap CPU op
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                blur_var = cv2.Laplacian(gray, cv2.CV_64F).var()
+
                 stub = {
                     'frame_idx':         raw_frame_idx,
                     'sampled_frame_idx': sampled_frame_idx,
                     'timestamp':         raw_frame_idx / fps,
+                    'blur_score':        float(blur_var),
                 }
                 batch_frames.append(frame)
                 batch_meta.append(stub)
+                blur_scores.append(float(blur_var))
 
                 # ── flush CLIP batch ──
                 if len(batch_frames) >= self.CLIP_BATCH_SIZE:
@@ -226,12 +233,23 @@ class VideoIndexer:
             size_mb = patch_embeddings_np.nbytes / (1024 * 1024)
             print(f"  Patch embeddings: {patch_embeddings_np.shape} ({size_mb:.0f} MB)")
 
+        # Save blur scores for quality-aware candidate selection
+        blur_path = os.path.join(output_dir, 'blur_scores.npy')
+        if blur_scores:
+            blur_np = np.array(blur_scores, dtype=np.float32)
+            np.save(blur_path, blur_np)
+            print(f"  Blur scores: {blur_np.shape} "
+                  f"(mean={blur_np.mean():.1f}, min={blur_np.min():.1f}, "
+                  f"max={blur_np.max():.1f})")
+
         print(f"Index saved to: {output_dir}")
         print(f"  - FAISS index: {index_path}")
         print(f"  - Metadata: {metadata_path}")
         print(f"  - CLIP embeddings: {embeddings_path}")
         if do_patches and patch_embeddings:
             print(f"  - Patch embeddings: {patch_emb_path}")
+        if blur_scores:
+            print(f"  - Blur scores: {blur_path}")
 
         return {
             'index_path': index_path,

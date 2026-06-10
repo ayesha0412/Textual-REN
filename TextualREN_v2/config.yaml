@@ -39,6 +39,17 @@ text_query:
   adaptive_threshold: true
   threshold_alpha: 1.0            # τ = μ + α·σ, clamped to [0.10, 0.30]
 
+  # Blur-aware frame quality gating (Laplacian variance)
+  # Frames below this threshold are penalized in candidate scoring
+  blur_threshold: 50.0            # < 50 = severe motion blur
+
+  # Query parser: "rule_based" (fast, no deps) or "llm" (local open-source model)
+  query_parser: "rule_based"
+  # LLM settings (only used when query_parser: "llm")
+  llm_backend: "ollama"           # "ollama" (recommended) or "transformers"
+  llm_model: "phi3:mini"          # ollama: phi3:mini, llama3.2:3b, mistral:7b
+                                  # transformers: microsoft/Phi-3-mini-4k-instruct
+
   # FAISS indexing parameters
   faiss:
     clip_dim: 1024                # ViT-g-14 output dim
