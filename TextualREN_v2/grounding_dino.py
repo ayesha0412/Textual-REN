@@ -92,6 +92,7 @@ class GroundingDINOLocalizer:
         clip_model=None,
         clip_preprocess=None,
         text_feat: torch.Tensor = None,
+        max_area_frac: float = 0.25,
     ) -> Optional[Tuple[List[int], float]]:
         """
         Return the single best detection as ([x, y, w, h], confidence).
@@ -99,10 +100,30 @@ class GroundingDINOLocalizer:
         When clip_model + text_feat are provided and multiple detections exist,
         each crop is scored with CLIP against the full text query to pick the
         best semantic match (not just the highest Grounding DINO confidence).
+
+        max_area_frac: reject detections larger than this fraction of the frame
+        (prevents whole-counter / scene-level false positives).
         """
         detections = self.detect(frame_rgb, text_query, box_threshold, text_threshold)
         if not detections:
             return None
+
+        # Filter out oversized detections — a single object shouldn't cover
+        # more than max_area_frac of the frame.  This catches scene-level
+        # false positives (e.g., GDino detecting the entire counter as "pan").
+        frame_h, frame_w = frame_rgb.shape[:2]
+        frame_area = frame_h * frame_w
+        sized = []
+        for det in detections:
+            bbox, score, label = det
+            det_area = bbox[2] * bbox[3]
+            if det_area / frame_area <= max_area_frac:
+                sized.append(det)
+        n_filtered = len(detections) - len(sized)
+        if n_filtered > 0:
+            print(f"  [size filter] removed {n_filtered} oversized detection(s) "
+                  f"(>{max_area_frac*100:.0f}% of frame)")
+        detections = sized if sized else detections  # keep originals as fallback
 
         if clip_model is None or text_feat is None:
             bbox, score, label = detections[0]

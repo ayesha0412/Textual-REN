@@ -18,7 +18,7 @@ import pickle
 
 # Must be set before any cv2.VideoCapture is opened — EPIC Kitchen / Ego4D videos
 # have interleaved audio+video streams that exhaust OpenCV's default packet limit.
-os.environ.setdefault('OPENCV_FFMPEG_READ_ATTEMPTS', '65536')
+os.environ['OPENCV_FFMPEG_READ_ATTEMPTS'] = '65536'
 
 import cv2
 import numpy as np

@@ -24,6 +24,8 @@ import json
 import argparse
 from typing import Dict, List, Tuple
 
+os.environ['OPENCV_FFMPEG_READ_ATTEMPTS'] = '65536'
+
 import cv2
 import numpy as np
 import torch
@@ -152,8 +154,10 @@ class CandidateRefiner:
     def _localize_grounding_dino(self, frame_rgb, text_feat, h, w):
         """Use Grounding DINO for direct text->bbox detection, CLIP re-ranks ties."""
         gdino_cfg = self.config.get('grounding_dino', {})
+        # Use expanded query for GDino detection (e.g. "pan" → "frying pan. cooking pan.")
+        det_query = self.query_engine._detection_query(self.text_query)
         result = self.query_engine.grounding_dino.best_box(
-            frame_rgb, self.text_query,
+            frame_rgb, det_query,
             box_threshold=gdino_cfg.get('box_threshold', 0.30),
             text_threshold=gdino_cfg.get('text_threshold', 0.25),
             clip_model=self.query_engine.localizer.clip_model,
@@ -408,69 +412,145 @@ class IndexedQueryEngine:
         print(f"  {num_valid_segments} segment(s) found, {len(selected_candidates)} candidate(s) selected (policy={selection_policy.policy_name})")
 
         # ---- Stage 3b: GDino+CLIP verified frame selection ----
+        # Improvement: Score ALL candidates and pick the best, rather than
+        # stopping at the first above-threshold frame.  This avoids accepting
+        # a borderline detection (plate→pan confusion at 0.19) when a much
+        # stronger match exists on a different segment peak.
         spatial_method = self.config.get('text_query', {}).get('spatial_method', 'grounding_dino')
         if spatial_method == 'grounding_dino' and len(selected_candidates) > 1:
             gdino_cfg = self.config.get('grounding_dino', {})
             box_thresh = gdino_cfg.get('box_threshold', 0.20)
             text_thresh = gdino_cfg.get('text_threshold', 0.20)
             min_clip_crop = self.config.get('text_query', {}).get('min_crop_verify', 0.17)
-            max_verify = min(len(selected_candidates), 8)
+            max_verify = min(len(selected_candidates), 12)
+            det_query = self._detection_query(text_query)
 
-            print(f"\n  Verifying up to {max_verify} candidates with GDino+CLIP "
+            # Pre-encode confusable class texts for negative suppression
+            conf_names, conf_feats = self._encode_confusable_texts(text_query)
+
+            print(f"\n  Verifying ALL {max_verify} candidates with GDino+CLIP "
                   f"(min_crop={min_clip_crop})...")
-            verified_idx = None
-            best_unverified = (None, -1.0)
-            for ci, cand in enumerate(selected_candidates[:max_verify]):
-                fidx = cand['frame_idx']
-                try:
-                    probe = self._load_single_frame(video_path, fidx)
-                except Exception:
-                    continue
-                result = self.grounding_dino.best_box(
-                    probe, text_query,
-                    box_threshold=box_thresh, text_threshold=text_thresh,
-                    clip_model=self.localizer.clip_model,
-                    clip_preprocess=self.localizer.clip_preprocess,
-                    text_feat=text_feat,
-                )
-                if result is None:
-                    print(f"    candidate {ci}: frame {fidx} "
-                          f"(t={fidx/fps:.1f}s) -- no detection")
-                    continue
-                bbox, clip_score = result
-                if clip_score >= min_clip_crop:
-                    print(f"    candidate {ci}: frame {fidx} "
-                          f"(t={fidx/fps:.1f}s) -- CLIP crop={clip_score:.3f} >= "
-                          f"{min_clip_crop} VERIFIED")
-                    verified_idx = ci
-                    break
-                else:
-                    print(f"    candidate {ci}: frame {fidx} "
-                          f"(t={fidx/fps:.1f}s) -- CLIP crop={clip_score:.3f} < "
-                          f"{min_clip_crop} (color/shape confusion?)")
-                    if clip_score > best_unverified[1]:
-                        best_unverified = (ci, clip_score)
+            if det_query != text_query:
+                print(f"  Detection query expanded: '{text_query}' -> '{det_query}'")
+            if conf_names:
+                print(f"  Confusable classes: {conf_names}")
 
-            if verified_idx is not None and verified_idx != 0:
-                old_frame = selected_candidates[0]['frame_idx']
-                selected_candidates = [selected_candidates[verified_idx]] + \
-                    [c for i, c in enumerate(selected_candidates) if i != verified_idx]
-                print(f"  Verified: frame {selected_candidates[0]['frame_idx']} "
-                      f"(was {old_frame})")
-            elif verified_idx is None and best_unverified[0] is not None:
-                bi = best_unverified[0]
-                if bi != 0:
-                    old_frame = selected_candidates[0]['frame_idx']
-                    selected_candidates = [selected_candidates[bi]] + \
-                        [c for i, c in enumerate(selected_candidates) if i != bi]
-                    print(f"  No frame passed CLIP threshold; using best "
-                          f"({best_unverified[1]:.3f}): frame "
-                          f"{selected_candidates[0]['frame_idx']} (was {old_frame})")
+            # Score every candidate — don't stop early
+            scored_candidates = []   # (ci, clip_crop_score, patch_verify_score, combined)
+            already_checked = set()
+
+            def _verify_range(start, end):
+                """Verify candidates in [start, end) range."""
+                for ci in range(start, min(end, len(selected_candidates))):
+                    if ci in already_checked:
+                        continue
+                    already_checked.add(ci)
+                    cand = selected_candidates[ci]
+                    fidx = cand['frame_idx']
+                    meta_idx = cand.get('meta_idx', None)
+                    try:
+                        probe = self._load_single_frame(video_path, fidx)
+                    except Exception:
+                        continue
+                    result = self.grounding_dino.best_box(
+                        probe, det_query,
+                        box_threshold=box_thresh, text_threshold=text_thresh,
+                        clip_model=self.localizer.clip_model,
+                        clip_preprocess=self.localizer.clip_preprocess,
+                        text_feat=text_feat,
+                    )
+                    if result is None:
+                        print(f"    candidate {ci}: frame {fidx} "
+                              f"(t={fidx/fps:.1f}s) -- no detection")
+                        continue
+
+                    bbox, clip_score = result
+
+                    # Negative-class suppression: check if the crop matches
+                    # a confusable object better than the target query
+                    confused = False
+                    if conf_feats is not None:
+                        bx, by, bw, bh = bbox
+                        crop = probe[by:by+bh, bx:bx+bw]
+                        is_conf, conf_score, conf_name = self._confusable_check(
+                            crop, clip_score, conf_names, conf_feats
+                        )
+                        if is_conf:
+                            confused = True
+                            print(f"    candidate {ci}: frame {fidx} "
+                                  f"(t={fidx/fps:.1f}s) -- CLIP crop={clip_score:.3f} "
+                                  f"BUT '{conf_name}'={conf_score:.3f} > target "
+                                  f"-> CONFUSED")
+
+                    # Patch spatial verification
+                    patch_score = self._patch_spatial_verify(
+                        meta_idx, bbox, text_np, probe.shape
+                    ) if meta_idx is not None else clip_score
+
+                    # Combined score — heavy penalty if confused
+                    if confused:
+                        combined = (0.6 * clip_score + 0.4 * patch_score) * 0.3
+                    else:
+                        combined = 0.6 * clip_score + 0.4 * patch_score
+
+                    if not confused:
+                        tag = "PASS" if clip_score >= min_clip_crop else "FAIL"
+                        print(f"    candidate {ci}: frame {fidx} "
+                              f"(t={fidx/fps:.1f}s) -- CLIP crop={clip_score:.3f}  "
+                              f"patch={patch_score:.3f}  combined={combined:.3f} {tag}")
+                    scored_candidates.append((ci, clip_score, patch_score, combined))
+
+            # First pass: check top-N candidates
+            _verify_range(0, max_verify)
+
+            # Auto-expand: if ALL candidates so far are confused, try more
+            passed = [(ci, cs, ps, cb) for ci, cs, ps, cb in scored_candidates
+                      if cs >= min_clip_crop and cb > 0.10]
+            if not passed and conf_feats is not None and max_verify < len(selected_candidates):
+                expand_to = min(len(selected_candidates), max_verify + 8)
+                print(f"  All {max_verify} candidates confused -- expanding to {expand_to}...")
+                _verify_range(max_verify, expand_to)
+                passed = [(ci, cs, ps, cb) for ci, cs, ps, cb in scored_candidates
+                          if cs >= min_clip_crop and cb > 0.10]
+
+            # Pick the candidate with highest combined score
+            if scored_candidates:
+                if passed:
+                    best_ci, best_cs, best_ps, best_cb = max(passed, key=lambda x: x[3])
+                    if best_ci != 0:
+                        old_frame = selected_candidates[0]['frame_idx']
+                        selected_candidates = [selected_candidates[best_ci]] + \
+                            [c for i, c in enumerate(selected_candidates) if i != best_ci]
+                        print(f"  Best verified: frame {selected_candidates[0]['frame_idx']} "
+                              f"(combined={best_cb:.3f}, was {old_frame})")
+                    else:
+                        print(f"  Best verified: frame {selected_candidates[0]['frame_idx']} "
+                              f"(combined={best_cb:.3f}, already first)")
                 else:
-                    print(f"  No frame passed CLIP threshold; keeping original "
-                          f"(best CLIP={best_unverified[1]:.3f})")
-            elif verified_idx is None:
+                    # No candidate passed — use highest combined anyway
+                    best_ci, best_cs, best_ps, best_cb = max(scored_candidates, key=lambda x: x[3])
+                    if best_ci != 0:
+                        old_frame = selected_candidates[0]['frame_idx']
+                        selected_candidates = [selected_candidates[best_ci]] + \
+                            [c for i, c in enumerate(selected_candidates) if i != best_ci]
+                        print(f"  No clean candidate; best combined: "
+                              f"frame {selected_candidates[0]['frame_idx']} "
+                              f"({best_cb:.3f}, was {old_frame})")
+                    else:
+                        print(f"  No clean candidate; keeping first "
+                              f"(combined={best_cb:.3f})")
+            else:
                 print(f"  GDino found nothing on any candidate; keeping original")
+
+        # Track whether the final result is a confident or confused detection
+        is_confused = False
+        if spatial_method == 'grounding_dino' and len(selected_candidates) > 1:
+            # Check if the winning candidate was from the "no clean candidate" fallback
+            if scored_candidates:
+                passed_final = [(ci, cs, ps, cb) for ci, cs, ps, cb in scored_candidates
+                                if cs >= min_clip_crop and cb > 0.10]
+                if not passed_final:
+                    is_confused = True
 
         best_candidate = selected_candidates[0]
         last_frame_idx = best_candidate['frame_idx']
@@ -530,12 +610,34 @@ class IndexedQueryEngine:
 
         bx, by, bw, bh = [int(v) for v in bbox]
         print(f"  Final Bbox: {[bx, by, bw, bh]}")
+        if is_confused:
+            print(f"  ** CONFUSED: all candidates matched confusable objects better "
+                  f"than '{text_query}' -- bbox is best guess but likely wrong **")
 
         # Save debug image
         debug_frame = frames[center_local].copy()
         px, py = int(region_point[0]), int(region_point[1])
-        cv2.circle(debug_frame, (px, py), 8, (255, 0, 0), 2)
-        cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
+        if is_confused:
+            # Red bbox + CONFUSED label for uncertain results
+            bbox_color = (255, 0, 0)   # Red in RGB
+            cv2.circle(debug_frame, (px, py), 8, (255, 0, 0), 2)
+            cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), bbox_color, 2)
+            # Add CONFUSED label above bbox
+            label = f"CONFUSED: '{text_query}' (best guess)"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.7
+            thickness = 2
+            (tw, th), _ = cv2.getTextSize(label, font, font_scale, thickness)
+            label_y = max(th + 10, by - 10)
+            # Background rectangle for text readability
+            cv2.rectangle(debug_frame, (bx, label_y - th - 6),
+                          (bx + tw + 6, label_y + 4), (0, 0, 0), -1)
+            cv2.putText(debug_frame, label, (bx + 3, label_y - 2),
+                        font, font_scale, (255, 80, 80), thickness)
+        else:
+            # Green bbox for confident results
+            cv2.circle(debug_frame, (px, py), 8, (255, 0, 0), 2)
+            cv2.rectangle(debug_frame, (bx, by), (bx + bw, by + bh), (0, 255, 0), 2)
         debug_path = os.path.join(output_dir, 'debug_last_frame.jpg')
         cv2.imwrite(debug_path, cv2.cvtColor(debug_frame, cv2.COLOR_RGB2BGR))
         print(f"  Debug frame saved: {debug_path}")
@@ -555,6 +657,7 @@ class IndexedQueryEngine:
             'last_frame_idx': last_frame_idx,
             'last_frame_timestamp': round(last_frame_idx / fps, 3),
             'pred_bbox': [bx, by, bw, bh],
+            'confused': is_confused,
             'clip_similarity': round(float(clip_sims[last_meta_idx]), 4),
             'fused_similarity': round(last_sim, 4),
             'region_point': list(region_point),
@@ -569,6 +672,179 @@ class IndexedQueryEngine:
             json.dump(result, f, indent=2)
 
         return result
+
+    # ------------------------------------------------------------------ #
+    # Detection query expansion                                            #
+    # ------------------------------------------------------------------ #
+
+    # Ambiguous single-word queries that confuse GDino with visually similar
+    # objects.  Expanding to multi-label GDino prompts ("frying pan. cooking
+    # pan.") produces more diverse detections for CLIP to re-rank.
+    _QUERY_EXPANSIONS = {
+        'pan':   'frying pan. cooking pan. saucepan',
+        'pot':   'cooking pot. saucepan',
+        'board': 'cutting board. chopping board',
+        'cup':   'coffee cup. drinking cup. tea cup',
+        'glass': 'drinking glass. wine glass',
+        'plate': 'dinner plate. serving plate',
+        'bowl':  'mixing bowl. cereal bowl',
+        'knife': 'kitchen knife. chopping knife',
+        'spoon': 'cooking spoon. tablespoon',
+        'lid':   'pot lid. pan lid. container lid',
+        'jar':   'glass jar. storage jar',
+        'box':   'cardboard box. storage box',
+        'bag':   'plastic bag. shopping bag',
+        'tin':   'tin can. baking tin',
+    }
+
+    def _detection_query(self, text_query: str) -> str:
+        """
+        Expand ambiguous short queries for Grounding DINO detection.
+
+        Single-word queries like "pan" are ambiguous — GDino may detect
+        plates, lids, or other round objects.  Expanding to "frying pan.
+        cooking pan." gives GDino more specific text conditioning and
+        produces more diverse candidates for CLIP to re-rank.
+
+        Multi-word queries (e.g., "cutting board") are already specific
+        and pass through unchanged.
+        """
+        q = text_query.lower().strip()
+        if ' ' not in q and q in self._QUERY_EXPANSIONS:
+            return self._QUERY_EXPANSIONS[q]
+        return text_query
+
+    # ------------------------------------------------------------------ #
+    # Negative-class (confusable) suppression                              #
+    # ------------------------------------------------------------------ #
+
+    # For each query, list objects that look similar and confuse GDino.
+    # If a detection crop scores higher for a confusable than for the
+    # target query in CLIP space, the detection is likely a false positive.
+    _CONFUSABLE_CLASSES = {
+        'pan':           ['plate', 'lid', 'tray', 'bowl'],
+        'pot':           ['vase', 'jar', 'mug', 'bucket'],
+        'plate':         ['lid', 'tray', 'pan'],
+        'bowl':          ['cup', 'mug', 'pot'],
+        'cup':           ['mug', 'jar', 'glass'],
+        'glass':         ['jar', 'bottle', 'cup'],
+        'lid':           ['plate', 'tray', 'pan bottom'],
+        'board':         ['shelf', 'counter', 'table', 'tray'],
+        'cutting board': ['counter', 'shelf', 'table', 'wooden surface'],
+        'sponge':        ['cloth', 'towel', 'rag', 'scrubber'],
+        'knife':         ['fork', 'spoon', 'spatula'],
+        'spoon':         ['fork', 'knife', 'spatula'],
+        'kettle':        ['water filter pitcher', 'jug', 'coffee maker'],
+    }
+
+    def _encode_confusable_texts(self, text_query: str):
+        """
+        Pre-encode confusable class texts for negative suppression.
+
+        Returns (confusable_names, confusable_feats) or (None, None).
+        confusable_feats: (C, 1024) tensor of L2-normalized text features.
+        """
+        q = text_query.lower().strip()
+        confusables = self._CONFUSABLE_CLASSES.get(q, [])
+        if not confusables:
+            return None, None
+
+        import open_clip
+        tokens = open_clip.tokenize(confusables).to(self.device)
+        with torch.no_grad():
+            feats = self.localizer.clip_model.encode_text(tokens).float()
+        feats = F.normalize(feats, dim=-1)
+        return confusables, feats
+
+    def _confusable_check(
+        self,
+        crop_rgb: np.ndarray,
+        target_clip_score: float,
+        confusable_names: list,
+        confusable_feats: torch.Tensor,
+    ) -> Tuple[bool, float, str]:
+        """
+        Check if a detection crop is more similar to a confusable class
+        than to the target query.
+
+        Returns (is_confused, max_confusable_score, worst_confusable_name).
+        is_confused=True means the crop matched a confusable better.
+        """
+        if confusable_feats is None or crop_rgb.size == 0:
+            return False, 0.0, ""
+
+        crop_t = self.localizer.clip_preprocess(
+            Image.fromarray(crop_rgb)
+        ).unsqueeze(0).to(self.device)
+        with torch.no_grad(), torch.autocast(
+            self.device.type, dtype=torch.bfloat16,
+            enabled=self.device.type == 'cuda'
+        ):
+            crop_feat = self.localizer.clip_model.encode_image(crop_t).float()
+        crop_feat = F.normalize(crop_feat, dim=-1)
+
+        sims = (crop_feat @ confusable_feats.T).squeeze(0).cpu()
+        max_idx = int(sims.argmax())
+        max_conf = float(sims[max_idx])
+        worst_name = confusable_names[max_idx]
+
+        # Confused if the best confusable score exceeds the target score
+        is_confused = max_conf > target_clip_score
+        return is_confused, max_conf, worst_name
+
+    # ------------------------------------------------------------------ #
+    # Patch-level spatial verification                                     #
+    # ------------------------------------------------------------------ #
+
+    def _patch_spatial_verify(
+        self,
+        meta_idx: int,
+        bbox: list,
+        text_np: np.ndarray,
+        frame_shape: tuple,
+    ) -> float:
+        """
+        Verify a detection bbox using pre-indexed CLIP patch tokens.
+
+        The 256 patch tokens form a 16×16 grid over the image.  We find
+        which patches overlap with the bbox and compute their max similarity
+        to the text query.  If the detection is correct, patches at that
+        location should strongly match the query.
+
+        Returns max patch similarity at the bbox location (0.0 if no patches).
+        """
+        if self.patch_embeddings is None or meta_idx is None:
+            return 0.0
+        if meta_idx >= len(self.patch_embeddings):
+            return 0.0
+
+        patches = self.patch_embeddings[meta_idx]  # (256, 1024)
+        h, w = frame_shape[:2]
+
+        # CLIP ViT-g-14: 16×16 patch grid
+        grid_h, grid_w = 16, 16
+
+        bx, by, bw, bh = bbox
+        # Map bbox to patch grid coordinates
+        px1 = max(0, int(bx / w * grid_w))
+        py1 = max(0, int(by / h * grid_h))
+        px2 = min(grid_w, int((bx + bw) / w * grid_w) + 1)
+        py2 = min(grid_h, int((by + bh) / h * grid_h) + 1)
+
+        # Collect patches inside the bbox
+        bbox_indices = []
+        for py in range(py1, py2):
+            for px in range(px1, px2):
+                idx = py * grid_w + px
+                if idx < len(patches):
+                    bbox_indices.append(idx)
+
+        if not bbox_indices:
+            return 0.0
+
+        bbox_patches = patches[bbox_indices]         # (K, 1024)
+        sims = (bbox_patches @ text_np.T).squeeze()  # (K,)
+        return float(sims.max()) if sims.size > 0 else 0.0
 
     # ------------------------------------------------------------------ #
     # Adaptive threshold                                                   #
