@@ -46,9 +46,10 @@ text_query:
   # Query parser: "rule_based" (fast, no deps) or "llm" (local open-source model)
   query_parser: "rule_based"
   # LLM settings (only used when query_parser: "llm")
-  llm_backend: "ollama"           # "ollama" (recommended) or "transformers"
-  llm_model: "phi3:mini"          # ollama: phi3:mini, llama3.2:3b, mistral:7b
-                                  # transformers: microsoft/Phi-3-mini-4k-instruct
+  llm_backend: "transformers"      # "transformers" (recommended) or "ollama"
+  llm_model: "Qwen/Qwen3-0.6B"   # transformers: Qwen/Qwen3-0.6B (0.6B, ~1.2GB VRAM)
+                                  #   alt: Qwen/Qwen3-1.7B (~3.4GB), microsoft/Phi-4-mini-instruct (~7.6GB)
+                                  # ollama: phi3:mini, llama3.2:3b, mistral:7b
 
   # FAISS indexing parameters
   faiss:

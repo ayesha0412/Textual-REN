@@ -276,8 +276,8 @@ class IndexedQueryEngine:
         tq_cfg = config.get('text_query', {})
         self.query_parser = QueryParser(
             mode=tq_cfg.get('query_parser', 'rule_based'),
-            llm_backend=tq_cfg.get('llm_backend', 'ollama'),
-            llm_model=tq_cfg.get('llm_model', 'phi3:mini'),
+            llm_backend=tq_cfg.get('llm_backend', 'transformers'),
+            llm_model=tq_cfg.get('llm_model', 'Qwen/Qwen3-0.6B'),
         )
 
         self.index_dir = index_dir

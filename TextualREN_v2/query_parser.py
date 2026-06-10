@@ -53,21 +53,29 @@ class QueryParser:
       - "board" -> "cutting board" (not whiteboard, not circuit board)
 
     LLM mode uses **open-source local models only** (no proprietary APIs):
-      - Ollama (recommended): runs models like phi3, llama3.2, mistral locally
-      - HuggingFace Transformers: loads small models like Phi-3-mini on GPU
+      - HuggingFace Transformers (default): Qwen3-0.6B — only 1.2GB VRAM,
+        highest tool-calling score (0.880) among sub-4B models
+      - Ollama: runs models like qwen3:0.6b, phi3:mini locally via REST API
     """
 
+    # Default HuggingFace model: Qwen3-0.6B
+    # - 0.6B params, ~1.2GB VRAM in bf16, ~0.5GB in 4-bit
+    # - Highest tool-calling/JSON score (0.880) among sub-4B models
+    # - Fits alongside CLIP ViT-g-14 (5GB) + GDino (0.8GB) on a single GPU
+    # Alternatives: "Qwen/Qwen3-1.7B", "microsoft/Phi-4-mini-instruct"
+    DEFAULT_HF_MODEL = "Qwen/Qwen3-0.6B"
+
     def __init__(self, mode: str = "rule_based", cache_dir: str = None,
-                 llm_backend: str = "ollama",
-                 llm_model: str = "phi3:mini",
+                 llm_backend: str = "transformers",
+                 llm_model: str = None,
                  ollama_url: str = "http://localhost:11434"):
         """
         Args:
             mode: "rule_based" or "llm"
             cache_dir: Directory for LLM response cache (default: .query_cache/)
-            llm_backend: "ollama" (local REST API) or "transformers" (HuggingFace)
-            llm_model: Model name — for ollama: "phi3:mini", "llama3.2:3b",
-                       "mistral:7b"; for transformers: HF model ID
+            llm_backend: "transformers" (HuggingFace, default) or "ollama"
+            llm_model: Model name — for transformers: HF model ID
+                       (default: Qwen/Qwen3-0.6B); for ollama: "qwen3:0.6b"
             ollama_url: Ollama server URL (default: http://localhost:11434)
         """
         self.mode = mode
@@ -75,9 +83,10 @@ class QueryParser:
             os.path.dirname(os.path.abspath(__file__)), '.query_cache'
         )
         self.llm_backend = llm_backend
-        self.llm_model = llm_model
+        self.llm_model = llm_model or self.DEFAULT_HF_MODEL
         self.ollama_url = ollama_url.rstrip('/')
-        self._hf_pipeline = None  # lazy-loaded for transformers backend
+        self._hf_model = None       # lazy-loaded
+        self._hf_tokenizer = None   # lazy-loaded
 
     def parse(self, text_query: str) -> QueryPlan:
         """
@@ -459,17 +468,17 @@ class QueryParser:
     # LLM-enhanced parser (open-source models only)                        #
     # ------------------------------------------------------------------ #
 
-    _LLM_SYSTEM_PROMPT = """You are a query parser for an egocentric kitchen video object localization system.
-Given a text query for an object to find in kitchen video, return a JSON object with:
-- "target": the disambiguated object name (e.g., "pan" -> "frying pan")
-- "detection_prompt": multi-label prompt for Grounding DINO detection (period-separated, e.g., "frying pan. cooking pan. saucepan")
-- "confusables": list of 3-6 visually similar objects that could be confused (e.g., ["plate", "lid", "tray"])
-- "retrieval_prompts": list of 3-4 CLIP text descriptions (e.g., ["a frying pan", "a cooking pan on the stove"])
-- "context_hint": one sentence describing what the object looks like in a kitchen (e.g., "metal cooking utensil with handle, usually on stove")
+    _LLM_SYSTEM_PROMPT = """You parse kitchen object queries into structured JSON for a visual localization system.
 
-The video is first-person (egocentric) from someone cooking in a kitchen.
-Focus on VISUAL confusion — objects that look similar in shape, color, or texture.
-Return ONLY valid JSON, no explanation."""
+Output JSON with these 5 fields:
+- "target": disambiguated object name
+- "detection_prompt": exactly 3 different synonyms/names for the object, period-separated. Each must be a DIFFERENT phrase. Use the object's common names, alternative names, or descriptive names.
+- "confusables": list of 3-5 real kitchen objects with similar visual appearance (shape, color, size)
+- "retrieval_prompts": list of 3 short visual descriptions starting with "a" or "the"
+- "context_hint": one sentence describing what it looks like in a kitchen
+
+Important: detection_prompt must have 3 UNIQUE labels. confusables must be real objects.
+Return ONLY valid JSON."""
 
     def _llm_parse(self, text_query: str) -> Optional[QueryPlan]:
         """
@@ -532,12 +541,43 @@ Return ONLY valid JSON, no explanation."""
             return None
 
     def _plan_from_dict(self, text_query: str, data: dict) -> QueryPlan:
-        """Create a QueryPlan from a parsed JSON dict."""
+        """Create a QueryPlan from a parsed JSON dict with quality cleanup."""
+        # Clean up detection_prompt: deduplicate labels
+        det = data.get('detection_prompt', text_query)
+        if isinstance(det, list):
+            det = ". ".join(det)
+        # Split, deduplicate, rejoin
+        labels = [l.strip().strip('.') for l in det.split('.') if l.strip()]
+        seen = set()
+        unique_labels = []
+        for l in labels:
+            lk = l.lower()
+            if lk not in seen and lk:
+                seen.add(lk)
+                unique_labels.append(l)
+        det = ". ".join(unique_labels) if unique_labels else text_query
+
+        # Clean up confusables: deduplicate, remove target name
+        raw_conf = data.get('confusables', [])
+        if isinstance(raw_conf, list):
+            target_lower = data.get('target', text_query).lower()
+            query_lower = text_query.lower()
+            seen_conf = set()
+            clean_conf = []
+            for c in raw_conf:
+                if isinstance(c, str):
+                    ck = c.lower().strip()
+                    # Skip if it's the target itself, or already seen
+                    if ck and ck not in seen_conf and ck != target_lower and ck != query_lower:
+                        seen_conf.add(ck)
+                        clean_conf.append(c.strip())
+            raw_conf = clean_conf
+
         return QueryPlan(
             original_query=text_query,
             target=data.get('target', text_query),
-            detection_prompt=data.get('detection_prompt', text_query),
-            confusables=data.get('confusables', []),
+            detection_prompt=det,
+            confusables=raw_conf,
             retrieval_prompts=data.get('retrieval_prompts', [f"a {text_query}"]),
             context_hint=data.get('context_hint', ''),
             domain='kitchen',
@@ -641,61 +681,148 @@ Return ONLY valid JSON, no explanation."""
 
     # ---- HuggingFace Transformers backend ----
 
+    # Fallback model if transformers is too old for Qwen3
+    _FALLBACK_HF_MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+
+    def _load_hf_model(self):
+        """
+        Lazy-load the HuggingFace model and tokenizer.
+
+        Default: Qwen/Qwen3-0.6B — 0.6B params, ~1.2GB VRAM in bf16.
+        Fits alongside CLIP ViT-g-14 (5GB) + Grounding DINO (0.8GB).
+
+        Fallback: Qwen/Qwen2.5-0.5B-Instruct if transformers < 4.51
+        (Qwen3 architecture not yet supported).
+        """
+        if self._hf_model is not None:
+            return
+
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        model_id = self.llm_model
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Check if transformers supports the requested model
+        try:
+            print(f"  [QueryParser] Loading {model_id} ...")
+            self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                model_id, trust_remote_code=True
+            )
+            self._hf_model = AutoModelForCausalLM.from_pretrained(
+                model_id,
+                dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+        except (ValueError, KeyError) as e:
+            if "does not recognize this architecture" in str(e) or "qwen3" in str(e).lower():
+                import transformers
+                print(f"  [QueryParser] transformers {transformers.__version__} "
+                      f"does not support {model_id}.")
+                print(f"  [QueryParser] Upgrade: pip install --upgrade transformers")
+                print(f"  [QueryParser] Falling back to {self._FALLBACK_HF_MODEL}")
+                model_id = self._FALLBACK_HF_MODEL
+                self.llm_model = model_id
+                self._hf_tokenizer = AutoTokenizer.from_pretrained(
+                    model_id, trust_remote_code=True
+                )
+                self._hf_model = AutoModelForCausalLM.from_pretrained(
+                    model_id,
+                    dtype=torch.bfloat16,
+                    device_map="auto",
+                    trust_remote_code=True,
+                )
+            else:
+                raise
+
+        self._hf_model.eval()
+
+        # Report VRAM usage
+        param_bytes = sum(p.numel() * p.element_size() for p in self._hf_model.parameters())
+        print(f"  [QueryParser] Loaded {model_id} on {device} "
+              f"({param_bytes / 1024**2:.0f} MB, "
+              f"{sum(p.numel() for p in self._hf_model.parameters()) / 1e6:.0f}M params)")
+
     def _call_transformers(self, prompt: str) -> Optional[str]:
         """
-        Call a local HuggingFace model via transformers pipeline.
+        Generate structured JSON using a local HuggingFace model.
 
-        Uses small instruction-tuned models that fit alongside CLIP+GDino:
-          - microsoft/Phi-3-mini-4k-instruct (3.8B, ~4GB in fp16)
-          - TinyLlama/TinyLlama-1.1B-Chat-v1.0 (1.1B, ~2GB in fp16)
+        Default model: Qwen/Qwen3-0.6B
+          - 0.6B params, ~1.2GB VRAM (bf16)
+          - Tool-calling score: 0.880 (highest among sub-4B models)
+          - Native JSON/tool-calling support via Qwen3 chat template
 
-        The model is loaded once and cached for subsequent queries.
+        Alternatives (set via llm_model):
+          - Qwen/Qwen3-1.7B   (~3.4GB VRAM, better quality but heavier)
+          - microsoft/Phi-4-mini-instruct  (~7.6GB VRAM, best reasoning)
         """
         try:
             import torch
-            from transformers import pipeline as hf_pipeline
         except ImportError:
-            print("  [QueryParser] transformers not installed")
+            print("  [QueryParser] torch not installed")
             return None
 
         try:
-            if self._hf_pipeline is None:
-                print(f"  [QueryParser] Loading HuggingFace model: {self.llm_model}")
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                self._hf_pipeline = hf_pipeline(
-                    "text-generation",
-                    model=self.llm_model,
-                    device_map="auto",
-                    torch_dtype=torch.float16,
-                    trust_remote_code=True,
-                )
-                print(f"  [QueryParser] Model loaded on {device}")
+            self._load_hf_model()
 
+            # Build chat messages
             messages = [
                 {"role": "system", "content": self._LLM_SYSTEM_PROMPT},
-                {"role": "user", "content": f'Query: "{prompt.split("Query:")[1].split(chr(10))[0].strip()}"'
+                {"role": "user", "content": f'Query: "{prompt.split("Query:")[1].split(chr(10))[0].strip().strip(chr(34))}"'
                  if 'Query:' in prompt else f'Query: "{prompt}"'},
             ]
 
-            output = self._hf_pipeline(
-                messages,
-                max_new_tokens=512,
-                temperature=0.01,
-                do_sample=False,
-                return_full_text=False,
+            # Apply chat template
+            # Qwen3 supports enable_thinking=False for fast JSON;
+            # Qwen2.5 and others don't have this param — use try/except
+            try:
+                text = self._hf_tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,  # Qwen3: skip thinking for fast JSON
+                )
+            except TypeError:
+                text = self._hf_tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+
+            inputs = self._hf_tokenizer(text, return_tensors="pt").to(
+                self._hf_model.device
             )
-            return output[0]['generated_text']
+
+            with torch.no_grad():
+                output_ids = self._hf_model.generate(
+                    **inputs,
+                    max_new_tokens=400,
+                    do_sample=False,
+                    temperature=None,
+                    top_p=None,
+                    repetition_penalty=1.3,  # penalize repeated phrases
+                )
+
+            # Decode only the new tokens (skip the prompt)
+            new_tokens = output_ids[0][inputs['input_ids'].shape[1]:]
+            response = self._hf_tokenizer.decode(new_tokens, skip_special_tokens=True)
+            return response.strip()
 
         except Exception as e:
             print(f"  [QueryParser] Transformers call failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def offload_llm(self):
         """Free GPU memory used by the HuggingFace LLM (if loaded)."""
-        if self._hf_pipeline is not None:
+        if self._hf_model is not None:
             import torch
-            del self._hf_pipeline
-            self._hf_pipeline = None
+            del self._hf_model
+            del self._hf_tokenizer
+            self._hf_model = None
+            self._hf_tokenizer = None
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             print("  [QueryParser] LLM offloaded from GPU")
