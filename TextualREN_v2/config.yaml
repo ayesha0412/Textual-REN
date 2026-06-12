@@ -97,7 +97,8 @@ text_query:
 
 # Grounding DINO — text-conditioned open-vocabulary object detection
 grounding_dino:
-  model_id: 'IDEA-Research/grounding-dino-tiny'
+  model_id: 'IDEA-Research/grounding-dino-base'  # tiny -> base: ~2x capacity,
+                                                 # same API; single-variable swap
   box_threshold: 0.20
   text_threshold: 0.20
 
