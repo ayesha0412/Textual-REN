@@ -16,6 +16,15 @@ text_query:
   tau_accept: 0.5               # p >= accept -> confident FOUND
   tau_abstain: 0.2              # p < abstain -> NOT FOUND (calibrated abstention)
                                 # between the two -> refinement zone (1.6)
+
+  # Exemplar re-ID (Contribution A): the verified detection bootstraps an
+  # instance-level exemplar bank (DINOv2) that sweeps the index for every
+  # other occurrence of the SAME object
+  exemplar_reid: true
+  exemplar_views: 8             # views harvested from detection + SAM2 track
+  exemplar_top_k: 12            # candidate index rows to verify per sweep
+  reid_sim_threshold: 0.6       # min DINOv2 similarity vs exemplar bank
+  max_reid_occurrences: 5       # cap on re-ID occurrences per query
   # If the final segment is weak, fall back to the strongest segment instead.
   last_segment_min_peak: 0.18   # absolute min peak to trust the last segment (= threshold)
   last_segment_min_rel: 0.60    # or relative to global peak (last >= rel * global)

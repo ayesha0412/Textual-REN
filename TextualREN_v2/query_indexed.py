@@ -292,6 +292,8 @@ class IndexedQueryEngine:
             _pw = os.path.join(os.path.dirname(os.path.abspath(__file__)), _pw)
         self.presence_model = PresenceModel(_pw)
 
+        self._exemplar_reid = None  # lazy (Contribution A)
+
         self.index_dir = index_dir
         self._load_index()
 
@@ -968,6 +970,112 @@ class IndexedQueryEngine:
         # Primary instance renders the result clip (multi-track export in 1.4)
         track = all_tracks[0]
 
+        # ---- Exemplar re-ID sweep (Contribution A) ----
+        # The verified detection bootstraps an instance-level exemplar bank
+        # (views harvested from the SAM2 track) that sweeps the WHOLE index
+        # for other occurrences of the same object instance.
+        reid_occurrences = []
+        _reid_on = self.config['text_query'].get('exemplar_reid', True)
+        if _reid_on and presence >= tau_abstain:
+            _t_reid = time.time()
+            try:
+                from exemplar_reid import ExemplarReID
+                if self._exemplar_reid is None:
+                    self._exemplar_reid = ExemplarReID(
+                        self.localizer.clip_model,
+                        self.localizer.clip_preprocess,
+                        device=self.device,
+                    )
+                _g2l = {g: i for i, g in enumerate(frame_indices)}
+                bank = self._exemplar_reid.build_bank(
+                    frames, _g2l, center_local, [bx, by, bw, bh],
+                    track if not _skip_sam2 else [],
+                    max_views=int(self.config['text_query'].get(
+                        'exemplar_views', 8)),
+                )
+                if bank is not None:
+                    print(f"\n  [ReID] Exemplar bank: {bank['num_views']} views; "
+                          f"sweeping index for other occurrences...")
+                    _ctx_frames = int(context_seconds * fps)
+                    _exclude = {i for i, m in enumerate(frame_metadata)
+                                if abs(m['frame_idx'] - last_frame_idx) <= _ctx_frames}
+                    rows = self._exemplar_reid.candidate_rows(
+                        bank, self.clip_embeddings, _exclude,
+                        top_k=int(self.config['text_query'].get(
+                            'exemplar_top_k', 12)),
+                    )
+                    _reid_thresh = float(self.config['text_query'].get(
+                        'reid_sim_threshold', 0.6))
+                    _max_occ = int(self.config['text_query'].get(
+                        'max_reid_occurrences', 5))
+                    gdino_cfg = self.config.get('grounding_dino', {})
+                    _det_q = self._detection_query(text_query)
+                    for _row, _row_score in rows:
+                        if len(reid_occurrences) >= _max_occ:
+                            break
+                        _fidx = frame_metadata[_row]['frame_idx']
+                        # one occurrence per temporal neighbourhood
+                        if any(abs(_fidx - occ['frame_idx']) <= _ctx_frames
+                               for occ in reid_occurrences):
+                            continue
+                        try:
+                            _probe = self._load_single_frame(video_path, _fidx)
+                        except Exception:
+                            continue
+                        _dets = self.grounding_dino.best_boxes(
+                            _probe, _det_q,
+                            box_threshold=gdino_cfg.get('box_threshold', 0.30),
+                            text_threshold=gdino_cfg.get('text_threshold', 0.25),
+                            top_k=3,
+                        )
+                        if not _dets:
+                            continue
+                        _hit = self._exemplar_reid.verify_candidate(
+                            _probe, [d[0] for d in _dets], bank,
+                            sim_threshold=_reid_thresh,
+                        )
+                        if _hit is not None:
+                            _rb, _rs = _hit
+                            reid_occurrences.append({
+                                'frame_idx': int(_fidx),
+                                'timestamp': round(_fidx / fps, 3),
+                                'bbox': _rb,
+                                's_reid': round(_rs, 4),
+                            })
+                            print(f"  [ReID] occurrence at t={_fidx/fps:.1f}s "
+                                  f"(frame {_fidx}, s_reid={_rs:.3f})")
+                            # Annotated thumbnail: visual verification of
+                            # every re-ID claim (and paper figure material)
+                            _ann = _probe.copy()
+                            cv2.rectangle(_ann, (_rb[0], _rb[1]),
+                                          (_rb[0] + _rb[2], _rb[1] + _rb[3]),
+                                          (0, 200, 255), 3)
+                            cv2.putText(_ann, f"reid {_rs:.2f}",
+                                        (_rb[0] + 3, max(20, _rb[1] - 8)),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                        (0, 200, 255), 2)
+                            cv2.imwrite(
+                                os.path.join(output_dir,
+                                             f"reid_occ_t{int(_fidx/fps)}s.jpg"),
+                                cv2.cvtColor(_ann, cv2.COLOR_RGB2BGR))
+                    if reid_occurrences:
+                        # Strongest re-ID agreement feeds back into fusion
+                        evidence.s_reid = max(o['s_reid']
+                                              for o in reid_occurrences)
+                        presence = self.presence_model.presence(evidence)
+                        decision = ('not_found' if presence < tau_abstain
+                                    else 'uncertain' if presence < tau_accept
+                                    else 'found')
+                        print(f"  [ReID] {len(reid_occurrences)} additional "
+                              f"occurrence(s); presence updated -> "
+                              f"{presence:.3f} ({decision})")
+                    else:
+                        print("  [ReID] no additional occurrences above "
+                              "threshold")
+            except Exception as e:
+                print(f"  [ReID] sweep failed: {e}")
+            _timing['reid_s'] = round(time.time() - _t_reid, 2)
+
         _timing['track_s'] = round(time.time() - _t_mark, 2)
 
         print("\nExporting result clip...")
@@ -1001,6 +1109,7 @@ class IndexedQueryEngine:
             'num_instances': len(instances),
             'instances': instances,
             'tracked_frames_per_instance': [len(t) for t in all_tracks],
+            'reid_occurrences': reid_occurrences,
             'confused': is_confused,
             'confidence': round(confidence_score, 4),
             'presence': round(presence, 4),
@@ -1054,6 +1163,17 @@ class IndexedQueryEngine:
                         'frames': tr,
                     }
                     for i, tr in enumerate(all_tracks)
+                ] + [
+                    {
+                        'instance_id': 100 + i,
+                        'source': 'reid',
+                        'seed_bbox': occ['bbox'],
+                        'score': occ['s_reid'],
+                        'num_frames': 1,
+                        'frames': [{'frame_idx': occ['frame_idx'],
+                                    'bbox': occ['bbox']}],
+                    }
+                    for i, occ in enumerate(reid_occurrences)
                 ],
                 'timing': _timing,
                 'config_hash': _config_hash,
