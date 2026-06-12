@@ -8,10 +8,12 @@ Parses ambiguous text queries into structured detection plans with:
   - CLIP retrieval prompts (richer text for CLS/patch matching)
 
 Two modes:
-  - "rule_based" (default): Fast, deterministic, no external deps.
-    Uses a kitchen/egocentric domain ontology to resolve ambiguity.
-  - "llm": Calls an LLM API for truly novel queries. Caches results
-    to disk for reproducibility. Falls back to rule_based on failure.
+  - "rule_based": Fast, deterministic, no external deps.
+    Uses the built-in ontology cache to resolve ambiguity.
+  - "llm" (default): A local LLM generates plans for ANY query — domain-agnostic.
+    The built-in ontology acts as a warm cache of pre-verified plans for common
+    objects; LLM outputs are disk-cached in the same format for reproducibility.
+    Set use_ontology=False to bypass the cache entirely (pure-LLM ablation).
 
 Usage:
     parser = QueryParser(mode="rule_based")
@@ -22,6 +24,7 @@ Usage:
 
 import os
 import json
+import time
 import hashlib
 from dataclasses import dataclass, field, asdict
 from typing import List, Optional, Dict
@@ -36,8 +39,9 @@ class QueryPlan:
     confusables: List[str]          # Objects that look similar (for negative suppression)
     retrieval_prompts: List[str]    # CLIP text prompts for CLS/patch retrieval
     context_hint: str               # Human-readable context (e.g., "metal cooking utensil on stove")
-    domain: str = "kitchen"         # Detected domain
-    confidence: float = 1.0         # Parser confidence (1.0 = dictionary match, 0.5 = heuristic)
+    domain: str = "general"         # Detected domain
+    confidence: float = 1.0         # Parser confidence (1.0 = ontology cache, 0.9 = LLM, 0.5 = heuristic)
+    source: str = "heuristic"       # Plan provenance: "ontology" | "llm" | "heuristic"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -45,9 +49,11 @@ class QueryPlan:
 
 class QueryParser:
     """
-    Domain-aware query parser for egocentric video object localization.
+    Domain-agnostic query parser for egocentric video object localization.
 
-    Resolves ambiguous queries using a kitchen/egocentric ontology:
+    Detection plans come from a local LLM (works for any object, any domain).
+    The built-in ontology is a warm cache of pre-verified plans for common
+    objects — a cache hit resolves ambiguity instantly:
       - "pan" -> "frying pan" (not camera pan, not washing pan)
       - "tap" -> "kitchen faucet" (not beer tap, not shoulder tap)
       - "board" -> "cutting board" (not whiteboard, not circuit board)
@@ -68,7 +74,8 @@ class QueryParser:
     def __init__(self, mode: str = "rule_based", cache_dir: str = None,
                  llm_backend: str = "transformers",
                  llm_model: str = None,
-                 ollama_url: str = "http://localhost:11434"):
+                 ollama_url: str = "http://localhost:11434",
+                 use_ontology: bool = True):
         """
         Args:
             mode: "rule_based" or "llm"
@@ -77,8 +84,11 @@ class QueryParser:
             llm_model: Model name — for transformers: HF model ID
                        (default: Qwen/Qwen3-0.6B); for ollama: "qwen3:0.6b"
             ollama_url: Ollama server URL (default: http://localhost:11434)
+            use_ontology: if False, bypass the built-in ontology cache so every
+                       query goes through the LLM (pure-LLM ablation mode)
         """
         self.mode = mode
+        self.use_ontology = use_ontology
         self.cache_dir = cache_dir or os.path.join(
             os.path.dirname(os.path.abspath(__file__)), '.query_cache'
         )
@@ -95,10 +105,10 @@ class QueryParser:
         Always tries rule-based first (fast, deterministic).
         If mode="llm" and rule-based has low confidence, calls LLM.
         """
-        # Try rule-based first
+        # Rule-based first: an ontology cache hit is instant and pre-verified
         plan = self._rule_based_parse(text_query)
 
-        # If LLM mode and rule-based wasn't confident, enhance with LLM
+        # LLM mode: generate a plan for anything the cache didn't cover
         if self.mode == "llm" and plan.confidence < 0.8:
             llm_plan = self._llm_parse(text_query)
             if llm_plan is not None:
@@ -117,7 +127,11 @@ class QueryParser:
         'pan': {
             'target': 'frying pan',
             'detection_prompt': 'frying pan. cooking pan. saucepan with handle',
-            'confusables': ['plate', 'lid', 'tray', 'bowl', 'wok', 'pot lid'],
+            # NOTE: no 'wok' here — a wok IS an acceptable answer to "pan"
+            # (co-hyponym, not a confusable). Confusable = an object the
+            # user would NOT accept as the answer.
+            'confusables': ['plate', 'pot lid', 'tray', 'bowl',
+                            'rice cooker', 'pot'],
             'retrieval_prompts': [
                 'a frying pan', 'a cooking pan on the stove',
                 'a saucepan with handle', 'a metal frying pan'
@@ -453,11 +467,11 @@ class QueryParser:
     }
 
     def _rule_based_parse(self, text_query: str) -> QueryPlan:
-        """Parse query using kitchen domain ontology."""
+        """Parse query via the ontology cache (if enabled), else heuristic."""
         q = text_query.lower().strip()
 
-        # Direct match in ontology
-        if q in self._KITCHEN_ONTOLOGY:
+        # Direct match in ontology cache
+        if self.use_ontology and q in self._KITCHEN_ONTOLOGY:
             entry = self._KITCHEN_ONTOLOGY[q]
             return QueryPlan(
                 original_query=text_query,
@@ -468,14 +482,15 @@ class QueryParser:
                 context_hint=entry['context'],
                 domain='kitchen',
                 confidence=1.0,
+                source='ontology',
             )
 
-        # Multi-word query: check if any word matches
+        # Multi-word query: check if any word matches the cache
         words = q.split()
         for word in reversed(words):  # last word is often the object
-            if word in self._KITCHEN_ONTOLOGY:
+            if self.use_ontology and word in self._KITCHEN_ONTOLOGY:
                 entry = self._KITCHEN_ONTOLOGY[word]
-                # Adjust detection prompt to include the full query
+                # Referring-expression pass-through: full query stays first
                 det_prompt = f"{text_query}. {entry['detection_prompt']}"
                 return QueryPlan(
                     original_query=text_query,
@@ -486,19 +501,21 @@ class QueryParser:
                     context_hint=entry['context'],
                     domain='kitchen',
                     confidence=0.8,
+                    source='ontology',
                 )
 
-        # Heuristic: generate confusables from category
+        # Heuristic: generate confusables from category co-membership
         confusables = self._heuristic_confusables(q)
         return QueryPlan(
             original_query=text_query,
             target=text_query,
             detection_prompt=text_query,
             confusables=confusables,
-            retrieval_prompts=[f"a {text_query}", f"a {text_query} in a kitchen"],
+            retrieval_prompts=[f"a {text_query}", f"a photo of a {text_query}"],
             context_hint=f"object described as '{text_query}'",
-            domain='kitchen',
+            domain='general',
             confidence=0.5,
+            source='heuristic',
         )
 
     def _heuristic_confusables(self, query: str) -> List[str]:
@@ -512,18 +529,50 @@ class QueryParser:
         # No category match — return generic kitchen objects that could confuse
         return []
 
+    def export_ontology_cache(self, out_dir: str = None) -> int:
+        """
+        Serialize every ontology entry into the unified plan-cache format.
+
+        Makes the "ontology = pre-verified warm cache of detection plans"
+        framing literal: each entry becomes the same JSON an LLM plan would
+        produce, tagged source="ontology". Files are prefixed "ontology_" so
+        they never shadow runtime LLM cache lookups.
+
+        Returns the number of files written.
+        """
+        out_dir = out_dir or self.cache_dir
+        os.makedirs(out_dir, exist_ok=True)
+        n = 0
+        for query, entry in self._KITCHEN_ONTOLOGY.items():
+            data = {
+                'query': query,
+                'target': entry['target'],
+                'detection_prompt': entry['detection_prompt'],
+                'confusables': entry['confusables'],
+                'retrieval_prompts': entry['retrieval_prompts'],
+                'context_hint': entry['context'],
+                'source': 'ontology',
+                'model': None,
+                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            }
+            key = hashlib.md5(query.lower().strip().encode()).hexdigest()
+            with open(os.path.join(out_dir, f"ontology_{key}.json"), 'w') as f:
+                json.dump(data, f, indent=2)
+            n += 1
+        return n
+
     # ------------------------------------------------------------------ #
     # LLM-enhanced parser (open-source models only)                        #
     # ------------------------------------------------------------------ #
 
-    _LLM_SYSTEM_PROMPT = """You parse kitchen object queries into structured JSON for a visual localization system.
+    _LLM_SYSTEM_PROMPT = """You parse object queries into structured JSON for a visual localization system.
 
 Output JSON with these 5 fields:
-- "target": disambiguated object name
+- "target": disambiguated object name (the concrete physical object the query refers to). Keep the queried object itself — query "zebra" means the animal zebra. NEVER substitute a scene, place, or broader category (not "zoo", not "wildlife").
 - "detection_prompt": exactly 3 different synonyms/names for the object, period-separated. Each must be a DIFFERENT phrase. Use the object's common names, alternative names, or descriptive names.
-- "confusables": list of 3-5 real kitchen objects with similar visual appearance (shape, color, size)
+- "confusables": list of 3-5 real objects with similar visual appearance (shape, color, size) that could plausibly appear in the same scene. A confusable must be an object the user would NOT accept as the answer — never a synonym, sub-type, or variant of the target.
 - "retrieval_prompts": list of 3 short visual descriptions starting with "a" or "the"
-- "context_hint": one sentence describing what it looks like in a kitchen
+- "context_hint": one sentence describing what the object looks like and where it typically appears
 
 Important: detection_prompt must have 3 UNIQUE labels. confusables must be real objects.
 Return ONLY valid JSON."""
@@ -577,7 +626,12 @@ Return ONLY valid JSON."""
                 print(f"  [QueryParser] Could not parse JSON from LLM response")
                 return None
 
-            # Cache result for reproducibility
+            # Cache result for reproducibility — unified plan-cache format
+            # (same fields whether the plan came from ontology or LLM)
+            data['query'] = text_query
+            data['source'] = 'llm'
+            data['model'] = self.llm_model
+            data['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%S')
             os.makedirs(self.cache_dir, exist_ok=True)
             with open(cache_path, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -590,12 +644,27 @@ Return ONLY valid JSON."""
 
     def _plan_from_dict(self, text_query: str, data: dict) -> QueryPlan:
         """Create a QueryPlan from a parsed JSON dict with quality cleanup."""
+        # Normalize keys: small LLMs occasionally misspell field names
+        # (observed: "retrieival_prompts" from Qwen3-0.6B) — fuzzy-match
+        # unknown keys onto the expected schema so no field is silently lost
+        import difflib
+        _expected = ['target', 'detection_prompt', 'confusables',
+                     'retrieval_prompts', 'context_hint']
+        for k in list(data.keys()):
+            if k not in _expected:
+                match = difflib.get_close_matches(k, _expected, n=1, cutoff=0.8)
+                if match and match[0] not in data:
+                    data[match[0]] = data[k]
+
         # Clean up detection_prompt: deduplicate labels
         det = data.get('detection_prompt', text_query)
         if isinstance(det, list):
             det = ". ".join(det)
-        # Split, deduplicate, rejoin
+        # Split, deduplicate, rejoin.  The full original query is always kept
+        # as the FIRST label — referring expressions ("red mug on the shelf")
+        # carry attributes/relations that Grounding DINO can ground directly.
         labels = [l.strip().strip('.') for l in det.split('.') if l.strip()]
+        labels = [text_query.strip()] + labels
         seen = set()
         unique_labels = []
         for l in labels:
@@ -621,15 +690,26 @@ Return ONLY valid JSON."""
                         clean_conf.append(c.strip())
             raw_conf = clean_conf
 
+        # Retrieval prompts: make sure the verbatim query is represented so
+        # CLIP retrieval sees the attributes of a referring expression too
+        retr = data.get('retrieval_prompts', [])
+        if not isinstance(retr, list):
+            retr = [str(retr)]
+        retr = [str(r).strip() for r in retr if str(r).strip()]
+        ql = text_query.lower().strip()
+        if not any(ql in r.lower() for r in retr):
+            retr = [f"a {text_query}"] + retr
+
         return QueryPlan(
             original_query=text_query,
             target=data.get('target', text_query),
             detection_prompt=det,
             confusables=raw_conf,
-            retrieval_prompts=data.get('retrieval_prompts', [f"a {text_query}"]),
+            retrieval_prompts=retr,
             context_hint=data.get('context_hint', ''),
-            domain='kitchen',
+            domain='general',
             confidence=0.9,
+            source='llm',
         )
 
     @staticmethod
@@ -751,6 +831,12 @@ Return ONLY valid JSON."""
         model_id = self.llm_model
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        # transformers 4.x expects torch_dtype=; 5.x renamed it to dtype=
+        import transformers as _transformers
+        _tf_major = int(_transformers.__version__.split('.')[0])
+        dtype_kw = ({'dtype': torch.bfloat16} if _tf_major >= 5
+                    else {'torch_dtype': torch.bfloat16})
+
         # Check if transformers supports the requested model
         try:
             print(f"  [QueryParser] Loading {model_id} ...")
@@ -759,9 +845,9 @@ Return ONLY valid JSON."""
             )
             self._hf_model = AutoModelForCausalLM.from_pretrained(
                 model_id,
-                dtype=torch.bfloat16,
                 device_map="auto",
                 trust_remote_code=True,
+                **dtype_kw,
             )
         except (ValueError, KeyError) as e:
             if "does not recognize this architecture" in str(e) or "qwen3" in str(e).lower():
@@ -777,9 +863,9 @@ Return ONLY valid JSON."""
                 )
                 self._hf_model = AutoModelForCausalLM.from_pretrained(
                     model_id,
-                    dtype=torch.bfloat16,
                     device_map="auto",
                     trust_remote_code=True,
+                    **dtype_kw,
                 )
             else:
                 raise
@@ -880,26 +966,39 @@ Return ONLY valid JSON."""
 if __name__ == '__main__':
     import argparse as _ap
     _p = _ap.ArgumentParser(description="Test QueryParser")
-    _p.add_argument('--mode', default='rule_based', choices=['rule_based', 'llm'])
-    _p.add_argument('--backend', default='ollama', choices=['ollama', 'transformers'])
-    _p.add_argument('--model', default='phi3:mini',
-                    help='Model name (ollama: phi3:mini, llama3.2:3b; '
-                         'transformers: microsoft/Phi-3-mini-4k-instruct)')
+    _p.add_argument('--mode', default='llm', choices=['rule_based', 'llm'])
+    _p.add_argument('--backend', default='transformers', choices=['ollama', 'transformers'])
+    _p.add_argument('--model', default=None,
+                    help='Model name (transformers default: Qwen/Qwen3-0.6B; '
+                         'ollama: qwen3:0.6b, phi3:mini)')
     _p.add_argument('--query', default=None, help='Single query to test')
+    _p.add_argument('--no-ontology', action='store_true',
+                    help='Bypass the ontology cache — every query goes through '
+                         'the LLM (pure-LLM ablation mode)')
+    _p.add_argument('--export-cache', action='store_true',
+                    help='Write all ontology entries to the plan cache and exit')
     _args = _p.parse_args()
 
     parser = QueryParser(
         mode=_args.mode,
         llm_backend=_args.backend,
         llm_model=_args.model,
+        use_ontology=not _args.no_ontology,
     )
+
+    if _args.export_cache:
+        n = parser.export_ontology_cache()
+        print(f"Exported {n} ontology entries to {parser.cache_dir}")
+        raise SystemExit(0)
 
     test_queries = [_args.query] if _args.query else [
         'pan', 'tap', 'knife', 'cutting board', 'kettle',
         'sponge', 'glass', 'potato masher',
     ]
 
-    print(f"Mode: {_args.mode}  Backend: {_args.backend}  Model: {_args.model}")
+    print(f"Mode: {_args.mode}  Backend: {_args.backend}  "
+          f"Model: {_args.model or QueryParser.DEFAULT_HF_MODEL}  "
+          f"Ontology: {'ON' if not _args.no_ontology else 'OFF (pure LLM)'}")
 
     for q in test_queries:
         plan = parser.parse(q)
@@ -911,3 +1010,4 @@ if __name__ == '__main__':
         print(f"  Retrieval:  {plan.retrieval_prompts}")
         print(f"  Context:    {plan.context_hint}")
         print(f"  Confidence: {plan.confidence}")
+        print(f"  Source:     {plan.source}")
