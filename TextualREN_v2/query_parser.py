@@ -310,6 +310,54 @@ class QueryParser:
             'context': 'fabric cloth for drying hands or dishes',
         },
 
+        'strainer': {
+            'target': 'mesh strainer',
+            'detection_prompt': 'mesh strainer. kitchen sieve with handle. wire mesh sieve',
+            'confusables': ['drain cover', 'sink plug', 'stove burner', 'hob ring', 'lid', 'pan'],
+            'retrieval_prompts': [
+                'a mesh strainer', 'a kitchen sieve with handle',
+                'a wire strainer near sink', 'a metal mesh sieve'
+            ],
+            'context': 'metal mesh bowl with handle for draining liquids from food',
+        },
+        'sieve': {
+            'target': 'mesh strainer',
+            'detection_prompt': 'mesh strainer. kitchen sieve with handle. wire mesh sieve',
+            'confusables': ['drain cover', 'sink plug', 'stove burner', 'hob ring', 'lid', 'pan'],
+            'retrieval_prompts': [
+                'a mesh sieve', 'a kitchen sieve with handle',
+                'a wire strainer near sink'
+            ],
+            'context': 'metal mesh bowl with handle for draining liquids from food',
+        },
+        'cooker': {
+            'target': 'cooker',
+            'detection_prompt': 'stove top. cooker. gas hob. electric hob. cooking range',
+            'confusables': ['oven', 'microwave', 'hot plate', 'toaster'],
+            'retrieval_prompts': [
+                'a kitchen cooker', 'a stove top with burners', 'a gas hob'
+            ],
+            'context': 'appliance with burners/hobs for cooking on top',
+        },
+        'can opener': {
+            'target': 'can opener',
+            'detection_prompt': 'can opener. tin opener. manual can opener',
+            'confusables': ['bottle opener', 'corkscrew', 'peeler', 'scissors'],
+            'retrieval_prompts': [
+                'a can opener', 'a tin opener', 'a manual can opener on counter'
+            ],
+            'context': 'handheld tool with cutting wheel for opening tin cans',
+        },
+        'colander': {
+            'target': 'colander',
+            'detection_prompt': 'colander. pasta strainer. large strainer. draining bowl',
+            'confusables': ['bowl', 'pot', 'strainer', 'sieve', 'lid'],
+            'retrieval_prompts': [
+                'a colander', 'a pasta colander', 'a colander with holes'
+            ],
+            'context': 'large bowl-shaped vessel with holes for draining pasta or vegetables',
+        },
+
         # === Containers ===
         'lid': {
             'target': 'pot lid',

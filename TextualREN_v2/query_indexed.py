@@ -740,8 +740,30 @@ class IndexedQueryEngine:
         cv2.imwrite(debug_path, cv2.cvtColor(debug_frame, cv2.COLOR_RGB2BGR))
         print(f"  Debug frame saved: {debug_path}")
 
-        # ---- Export clip ----
-        track = [{'frame_idx': last_frame_idx, 'bbox': [bx, by, bw, bh]}]
+        # ---- SAM2 Tracking or single-frame export ----
+        _skip_sam2 = self.config['text_query'].get('skip_sam2_eval', True)
+
+        if not _skip_sam2:
+            # Detect once, track with SAM2 across the context window
+            print(f"\n  SAM2 tracking from seed bbox {[bx, by, bw, bh]} on frame {last_frame_idx}...")
+            try:
+                track = self.localizer.track_from_bbox(
+                    frames, center_local,
+                    torch.tensor([bx, by, bw, bh]),
+                    half_span=len(frames) // 2,
+                )
+                # Remap local frame indices back to global
+                for t in track:
+                    local_idx = t['frame_idx']
+                    if local_idx < len(frame_indices):
+                        t['frame_idx'] = frame_indices[local_idx]
+                print(f"  SAM2 tracked {len(track)} frames with bbox")
+            except Exception as e:
+                print(f"  SAM2 tracking failed: {e}, using single-frame bbox")
+                track = [{'frame_idx': last_frame_idx, 'bbox': [bx, by, bw, bh]}]
+        else:
+            track = [{'frame_idx': last_frame_idx, 'bbox': [bx, by, bw, bh]}]
+
         print("\nExporting result clip...")
         self.localizer.export_clip(
             video_path, track, last_frame_idx,
