@@ -285,13 +285,27 @@ class TextQueryLocalizer:
     # SAM2 tracking                                                        #
     # ------------------------------------------------------------------ #
 
-    def track_from_bbox(self, frames: list,
-                         frame_idx: int,
-                         bbox: torch.Tensor,
-                         half_span: int = 150) -> list:
+    @staticmethod
+    def _encode_rle(mask: np.ndarray) -> dict:
+        """COCO RLE encoding of a binary mask (pycocotools format)."""
+        from pycocotools import mask as mask_utils
+        rle = mask_utils.encode(np.asfortranarray(mask.astype(np.uint8)))
+        return {'size': list(rle['size']), 'counts': rle['counts'].decode('ascii')}
+
+    def track_from_bboxes(self, frames: list,
+                           frame_idx: int,
+                           bboxes: list,
+                           half_span: int = 150,
+                           return_masks: bool = False) -> list:
         """
-        Runs SAM2 video predictor forward from frame_idx within a ±half_span window.
-        Returns list of {'frame_idx': int, 'bbox': [x,y,w,h]}.
+        Track MULTIPLE seed bboxes in ONE SAM2 video session.
+
+        A single propagation pass handles all objects — running one session
+        per object re-uploads every frame and stacks inference states until
+        VRAM spills into (Windows) shared memory, a ~40x slowdown.
+
+        Returns a list of tracks, index-aligned with bboxes; each track is
+        a list of {'frame_idx': int, 'bbox': [x, y, w, h]}.
         """
         from sam2.build_sam import build_sam2_video_predictor
 
@@ -310,34 +324,71 @@ class TextQueryLocalizer:
         h, w = np.array(window[0]).shape[:2]
         local_idx = frame_idx - start
 
-        x, y, bw, bh = [float(v) for v in bbox]
         tracker = build_sam2_video_predictor(self.tracker_param, self.sam2_ckpt, device=self.device)
-        track = []
+        tracks = [[] for _ in bboxes]
 
         with torch.inference_mode(), torch.autocast(
             self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
         ):
-            state = tracker.init_state(images=transformed, video_height=h, video_width=w)
-            tracker.reset_state(state)
-            tracker.add_new_points_or_box(
-                inference_state=state,
-                frame_idx=local_idx,
-                obj_id=0,
-                box=[x, y, x + bw, y + bh],
+            # offload_state_to_cpu: per-frame memory (maskmem features +
+            # predicted masks) accumulates across the whole window during
+            # propagation — keeping it on GPU alongside CLIP ViT-g caused
+            # progressive VRAM pressure (reverse pass at 1.96 s/frame vs
+            # 0.57 s/frame forward). CPU storage costs a small per-frame
+            # transfer instead.
+            state = tracker.init_state(
+                images=transformed, video_height=h, video_width=w,
+                offload_state_to_cpu=True,
             )
-            for fid, _, mask_logits in tracker.propagate_in_video(state):
-                mask = (mask_logits[0] > 0.0)[0].cpu().numpy()
-                if mask.sum() == 0:
-                    continue
-                rows, cols = np.where(mask)
-                track.append({
-                    'frame_idx': start + fid,
-                    'bbox': [int(cols.min()), int(rows.min()),
-                              int(cols.max() - cols.min()), int(rows.max() - rows.min())],
-                })
+            tracker.reset_state(state)
+            for obj_id, bbox in enumerate(bboxes):
+                x, y, bw, bh = [float(v) for v in bbox]
+                tracker.add_new_points_or_box(
+                    inference_state=state,
+                    frame_idx=local_idx,
+                    obj_id=obj_id,
+                    box=[x, y, x + bw, y + bh],
+                )
+            # Bidirectional propagation: one SAM2 pass only tracks in ONE
+            # direction from the seed frame — without the reverse pass,
+            # every frame BEFORE the seed gets no boxes at all (RELOCATE
+            # tracks bidirectionally for exactly this reason).
+            seen = [set() for _ in bboxes]
+            for _reverse in (False, True):
+                for fid, obj_ids, mask_logits in tracker.propagate_in_video(
+                        state, start_frame_idx=local_idx, reverse=_reverse):
+                    for k, oid in enumerate(obj_ids):
+                        if fid in seen[oid]:
+                            continue
+                        mask = (mask_logits[k] > 0.0)[0].cpu().numpy()
+                        if mask.sum() == 0:
+                            continue
+                        seen[oid].add(fid)
+                        rows, cols = np.where(mask)
+                        entry = {
+                            'frame_idx': start + fid,
+                            'bbox': [int(cols.min()), int(rows.min()),
+                                      int(cols.max() - cols.min()),
+                                      int(rows.max() - rows.min())],
+                        }
+                        if return_masks:
+                            entry['mask_rle'] = self._encode_rle(mask)
+                        tracks[oid].append(entry)
 
+        for tr in tracks:
+            tr.sort(key=lambda t: t['frame_idx'])
+
+        # Free the session aggressively before anything else touches the GPU
+        del state, tracker, transformed
         torch.cuda.empty_cache()
-        return track
+        return tracks
+
+    def track_from_bbox(self, frames: list,
+                         frame_idx: int,
+                         bbox: torch.Tensor,
+                         half_span: int = 150) -> list:
+        """Single-object wrapper around track_from_bboxes()."""
+        return self.track_from_bboxes(frames, frame_idx, [bbox], half_span)[0]
 
     # ------------------------------------------------------------------ #
     # Clip export                                                          #
