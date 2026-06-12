@@ -278,7 +278,8 @@ class QueryParser:
         'kettle': {
             'target': 'electric kettle',
             'detection_prompt': 'electric kettle. tea kettle. water kettle. stovetop kettle',
-            'confusables': ['water filter pitcher', 'jug', 'coffee maker', 'teapot', 'thermos'],
+            'confusables': ['water filter pitcher', 'jug', 'coffee maker', 'teapot',
+                            'thermos', 'rice cooker', 'cooking pot'],
             'retrieval_prompts': [
                 'an electric kettle', 'a tea kettle', 'a water kettle on counter'
             ],

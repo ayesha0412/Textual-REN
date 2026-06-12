@@ -9,6 +9,9 @@ text_query:
   neg_weight: 0.25              # weight for negative prompts (0 = disabled)
   confusable_margin_delta: 0.03 # confusable must WIN by this margin to reject
                                 # (CLIP sims closer than ~0.03 are noise)
+  min_clean_margin: 0.02        # target must WIN by this margin for a candidate
+                                # to be eligible as the response (tie-band passers
+                                # remain fallback only); interim until fitted weights
 
   # Evidence fusion (Contribution C): all verification signals fuse into one
   # presence posterior p = sigma(w·f + b); weights fit ONCE on dev, frozen
@@ -35,9 +38,12 @@ text_query:
 
   # RELOCATE Stage 3: Selection Policy
   selection_policy: "last"      # "last", "strongest", "topk", "topp"
-  verified_selection: "latest"  # among verification-PASSING candidates:
+  verified_selection: "best"    # among verification-PASSING candidates:
                                 # "latest" = most recent (episodic/VQ2D semantics)
-                                # "best"   = highest combined score (legacy v3)
+                                # "best"   = highest combined score
+                                # INTERIM "best": "latest" requires per-candidate
+                                # calibrated acceptance (fitted weights / refinement
+                                # loop) — near-tie look-alikes currently win recency
   selection_top_k: 10           # For topk/topp mode
   selection_top_p: 0.9          # Nucleus sampling threshold
   nms_threshold: 0.5            # Inter-frame NMS: suppress within 0.5s

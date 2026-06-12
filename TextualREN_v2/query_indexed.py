@@ -588,6 +588,7 @@ class IndexedQueryEngine:
                         print(f"    candidate {ci}: frame {fidx} "
                               f"(t={fidx/fps:.1f}s) -- CLIP={clip_score:.3f} "
                               f"patch={patch_score:.3f} blur={blur_norm:.2f}{blur_tag} "
+                              f"marg={conf_margin:+.3f} "
                               f"combined={combined:.3f} {tag}")
 
                     scored_candidates.append({
@@ -638,13 +639,25 @@ class IndexedQueryEngine:
             # on score noise (observed: 0.007 score gap = 130s temporal error).
             verified_selection = self.config.get('text_query', {}).get(
                 'verified_selection', 'latest')
+            # Tie-band candidates (target beat its confusables by less than
+            # min_clean_margin) may PASS, but cannot BE the response while a
+            # cleanly-verified candidate exists — a near-tie carries no
+            # information about which look-alike it is. Interim rule until
+            # presence weights are fitted on dev labels.
+            min_clean_margin = self.config.get('text_query', {}).get(
+                'min_clean_margin', 0.02)
+            clean = [s for s in passed if s['conf_margin'] >= min_clean_margin]
+            if passed and len(clean) < len(passed):
+                print(f"  {len(clean)}/{len(passed)} passing candidate(s) are "
+                      f"cleanly verified (margin >= {min_clean_margin})")
+            pick_from = clean if clean else passed
             if scored_candidates:
-                if passed:
+                if pick_from:
                     if verified_selection == 'latest':
-                        best = max(passed, key=lambda x:
+                        best = max(pick_from, key=lambda x:
                                    selected_candidates[x['ci']]['frame_idx'])
                     else:
-                        best = max(passed, key=lambda x: x['combined'])
+                        best = max(pick_from, key=lambda x: x['combined'])
                 else:
                     best = max(scored_candidates, key=lambda x: x['combined'])
 
