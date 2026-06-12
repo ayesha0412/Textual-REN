@@ -57,6 +57,13 @@ The pipeline is designed for episodic memory use cases — "where did I last put
 - **Adaptive threshold** — per-query threshold computed from the similarity distribution (`tau = mean + alpha * std`), replacing the fixed `tau=0.18`
 - **GDino+CLIP verified frame selection** — verifies segment peak candidates with Grounding DINO detection + CLIP crop scoring, filtering color/shape confusion (e.g., red bucket misidentified as "pink flower")
 
+**Textual-REN v4** (current, in `TextualREN_v2/`) adds:
+- **LLM query plans** — a local Qwen3-0.6B parses any query into a structured detection plan (disambiguated target, detection prompts, confusable classes); the built-in ontology acts as a pre-verified plan cache, with `use_ontology: false` for pure-LLM mode. Plans are disk-cached with source/model/timestamp for reproducibility.
+- **Multi-instance detection & tracking** — `best_boxes()` returns every matching object (NMS-deduplicated, per-instance confusable suppression + score floor); all instances are tracked in ONE shared SAM2 session with forward+backward propagation and CPU state offload.
+- **Evidence fusion with calibrated abstention** — nine verification signals (CLIP crop score, patch score, confusable margin, blur quality, appearance consensus, GDino confidence, retrieval peak, area fraction, re-ID similarity) fuse into a single logistic presence score with `found / uncertain / not_found` zones. Abstention is decided *before* tracking, so absent objects skip the most expensive stage. Weights live in `TextualREN_v2/configs/presence_weights.json`.
+- **Machine-readable export** — `--json-out` writes the full result: query plan, evidence vector, presence score, per-instance tracks with COCO RLE masks, per-stage timing, and config+git provenance hashes.
+- **Last-occurrence selection** — among verification-passing candidates the most *recent* is returned (`verified_selection: "latest"`), preserving episodic-memory semantics instead of score-noise ranking.
+
 ---
 
 ### Model Architecture
@@ -586,10 +593,12 @@ Else:
 
 | File | Purpose | Key Functions |
 |------|---------|---|
-| `text_query/query_indexed.py` | Phase 2 query engine | `IndexedQueryEngine.query()`, `CandidateRefiner`, `SelectionPolicy` |
-| `text_query/grounding_dino.py` | **(v2)** Spatial localization | `GroundingDINOLocalizer.detect()`, `best_box()` with CLIP re-ranking |
-| `text_query/localizer.py` | CLIP + SAM2 utilities | `TextQueryLocalizer.encode_text()`, `point_to_bbox()` |
-| `text_query/prepare_index.py` | Phase 1 indexing | `prepare_faiss_index()`, `_extract_patch_tokens_batch()`, OCR text detection |
+| `TextualREN_v2/query_indexed.py` | Phase 2 query engine | `IndexedQueryEngine.query()`, `CandidateRefiner`, `_confusable_check()` |
+| `TextualREN_v2/query_parser.py` | **(v4)** LLM query plans | `QueryParser.parse()`, ontology cache, Qwen3 backend |
+| `TextualREN_v2/evidence_fusion.py` | **(v4)** Presence posterior | `EvidenceVector`, `PresenceModel.presence()` / `.fit()` |
+| `TextualREN_v2/grounding_dino.py` | Spatial localization | `detect()`, `best_boxes()` multi-instance, `best_box()` top-1 |
+| `TextualREN_v2/localizer.py` | CLIP + SAM2 utilities | `encode_text()`, `track_from_bboxes()` (one-session, bidirectional) |
+| `TextualREN_v2/prepare_index.py` | Phase 1 indexing | `prepare_faiss_index()`, patch tokens, blur scores |
 | `visual_query/models.py` | REN model class | `REN.__init__()`, `REN.forward()`, grid_points initialization |
 | `visual_query/vq_utils.py` | SAM2 interface | `get_sam_region_from_points()`, mask→bbox utilities |
 
@@ -884,19 +893,36 @@ REN/
 
 ```yaml
 text_query:
-  similarity_threshold: 0.18   # CLIP cosine threshold (fallback when adaptive is off)
-  adaptive_threshold: true      # (v2) per-query threshold from similarity distribution
-  threshold_alpha: 1.0          # (v2) tau = mean + alpha*std, clamped [0.10, 0.30]
-  spatial_method: "grounding_dino"  # (v2) "grounding_dino" or "ren_clip" (legacy)
-  context_seconds: 0.5          # ±N/2 seconds context window
+  similarity_threshold: 0.18    # CLIP cosine threshold (fallback when adaptive is off)
+  adaptive_threshold: true      # per-query threshold from similarity distribution
+  threshold_alpha: 1.0          # tau = mean + alpha*std, clamped [0.10, 0.30]
+  spatial_method: "grounding_dino"  # "grounding_dino" or "ren_clip" (legacy)
+  context_seconds: 6.0          # ±3 s context window around the response frame
   frame_sample_rate: 10         # index every Nth frame (10 = ~6 fps at 60 fps)
-  ocr_weight: 0.3               # weight of OCR score in fused similarity
-  min_crop_verify: 0.17         # min CLIP crop score for GDino+CLIP frame verification
-  faiss:
-    use_patch_rerank: true      # (v2) re-rank top-k using CLIP patch tokens
-    patch_top_k: 100            # (v2) how many CLS candidates to re-rank
+  min_crop_verify: 0.17         # min CLIP crop score for verified frame selection
+  confusable_margin_delta: 0.03 # confusable must WIN by this margin to reject
+  verified_selection: "latest"  # "latest" (episodic semantics) or "best" (legacy)
+  skip_sam2_eval: false         # SAM2 tracks every instance across the window
+  multi_instance: true          # detect ALL matching objects on the response frame
+  max_instances: 5
+  save_masks: true              # COCO RLE masks in --json-out exports
 
-grounding_dino:                 # (v2) text-conditioned zero-shot detection
+  # (v4) LLM query plans — ontology acts as a pre-verified plan cache
+  query_parser: "llm"
+  use_ontology: true            # false = every query goes through the LLM
+  llm_backend: "transformers"
+  llm_model: "Qwen/Qwen3-0.6B"
+
+  # (v4) Evidence fusion: presence posterior + calibrated abstention
+  presence_weights: 'configs/presence_weights.json'
+  tau_accept: 0.5               # p >= accept -> confident FOUND
+  tau_abstain: 0.2              # p < abstain -> NOT FOUND, tracking skipped
+
+  faiss:
+    use_patch_rerank: true      # re-rank top-k using CLIP patch tokens
+    patch_top_k: 100
+
+grounding_dino:                 # text-conditioned zero-shot detection
   model_id: 'IDEA-Research/grounding-dino-tiny'
   box_threshold: 0.20
   text_threshold: 0.20

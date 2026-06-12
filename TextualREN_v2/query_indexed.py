@@ -21,6 +21,8 @@ Usage:
 import os
 import sys
 import json
+import time
+import hashlib
 import argparse
 from typing import Dict, List, Tuple
 
@@ -35,6 +37,8 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'))
+
+from evidence_fusion import EvidenceVector, PresenceModel
 
 try:
     import faiss
@@ -272,13 +276,21 @@ class IndexedQueryEngine:
 
         self._grounding_dino = None
 
-        # Query parser: domain-aware query understanding
+        # Query parser: domain-agnostic query understanding
+        # (ontology = warm cache of pre-verified plans; LLM covers the rest)
         tq_cfg = config.get('text_query', {})
         self.query_parser = QueryParser(
             mode=tq_cfg.get('query_parser', 'rule_based'),
             llm_backend=tq_cfg.get('llm_backend', 'transformers'),
             llm_model=tq_cfg.get('llm_model', 'Qwen/Qwen3-0.6B'),
+            use_ontology=tq_cfg.get('use_ontology', True),
         )
+
+        # Evidence fusion: presence posterior over all verification signals
+        _pw = tq_cfg.get('presence_weights', 'configs/presence_weights.json')
+        if not os.path.isabs(_pw):
+            _pw = os.path.join(os.path.dirname(os.path.abspath(__file__)), _pw)
+        self.presence_model = PresenceModel(_pw)
 
         self.index_dir = index_dir
         self._load_index()
@@ -351,6 +363,7 @@ class IndexedQueryEngine:
         # Ablation flags
         ablation_no_verification: bool = False,
         ablation_use_strongest: bool = False,
+        json_out: str = None,
     ) -> Dict:
         """
         Find the last genuine occurrence of text_query in the indexed video.
@@ -369,6 +382,9 @@ class IndexedQueryEngine:
         fps = self.metadata['fps']
         frame_metadata = self.metadata['frame_metadata']
         sample_rate = self.metadata.get('sample_rate', 10)
+
+        _t_start = time.time()
+        _timing = {}
 
         # ---- Stage 1: encode text query ----
         print(f"\nQuery: '{text_query}'")
@@ -440,6 +456,10 @@ class IndexedQueryEngine:
         consensus_iou = 0.0
         blur_quality = 1.0
         confusable_margin = 0.0
+        consensus_app = 0.0       # appearance consensus (CLIP-crop cosine)
+        best_evidence = None      # best candidate's raw signals for fusion
+        _timing['retrieve_s'] = round(time.time() - _t_start, 2)
+        _t_mark = time.time()
 
         if spatial_method == 'grounding_dino' and len(selected_candidates) > 1:
             gdino_cfg = self.config.get('grounding_dino', {})
@@ -454,15 +474,24 @@ class IndexedQueryEngine:
             det_query = query_plan.detection_prompt
             conf_names = query_plan.confusables
 
-            # Pre-encode confusable class texts for negative suppression
+            # Pre-encode confusable class texts for negative suppression,
+            # plus the disambiguated target phrase for a fair comparison
+            conf_margin_delta = self.config.get('text_query', {}).get(
+                'confusable_margin_delta', 0.03)
             if conf_names:
                 import open_clip
                 tokens = open_clip.tokenize(conf_names).to(self.device)
                 with torch.no_grad():
                     conf_feats = self.localizer.clip_model.encode_text(tokens).float()
                 conf_feats = F.normalize(conf_feats, dim=-1)
+                tgt_tokens = open_clip.tokenize([query_plan.target]).to(self.device)
+                with torch.no_grad():
+                    target_conf_feat = self.localizer.clip_model.encode_text(
+                        tgt_tokens).float()
+                target_conf_feat = F.normalize(target_conf_feat, dim=-1)
             else:
                 conf_feats = None
+                target_conf_feat = None
 
             print(f"\n  [QueryParser] target='{query_plan.target}' "
                   f"(confidence={query_plan.confidence})")
@@ -495,31 +524,38 @@ class IndexedQueryEngine:
                     except Exception:
                         continue
 
-                    result = self.grounding_dino.best_box(
+                    boxes = self.grounding_dino.best_boxes(
                         probe, det_query,
                         box_threshold=box_thresh, text_threshold=text_thresh,
                         clip_model=self.localizer.clip_model,
                         clip_preprocess=self.localizer.clip_preprocess,
                         text_feat=text_feat,
+                        top_k=1,
                     )
-                    if result is None:
+                    if not boxes:
                         blur_tag = f" BLURRY({frame_blur:.0f})" if is_blurry else ""
                         print(f"    candidate {ci}: frame {fidx} "
                               f"(t={fidx/fps:.1f}s) -- no detection{blur_tag}")
                         continue
 
-                    bbox, clip_score = result
+                    bbox, clip_score, gdino_score, _label = boxes[0]
 
                     # ---- Negative-class suppression ----
                     confused = False
                     conf_margin = clip_score  # margin = target - max_confusable
+                    crop_feat = None
                     if conf_feats is not None:
                         bx, by, bw, bh = bbox
                         crop = probe[by:by+bh, bx:bx+bw]
-                        is_conf, conf_score, conf_name = self._confusable_check(
-                            crop, clip_score, conf_names, conf_feats
-                        )
-                        conf_margin = clip_score - conf_score
+                        is_conf, conf_score, conf_name, target_eff, crop_feat = \
+                            self._confusable_check(
+                                crop, clip_score, conf_names, conf_feats,
+                                target_feat=target_conf_feat,
+                                margin=conf_margin_delta,
+                            )
+                        # Honest margin: effective target (max of raw query
+                        # and disambiguated phrase) minus best confusable
+                        conf_margin = target_eff - conf_score
                         if is_conf:
                             confused = True
                             print(f"    candidate {ci}: frame {fidx} "
@@ -558,6 +594,7 @@ class IndexedQueryEngine:
                         'confused': confused, 'blur_score': frame_blur,
                         'blur_norm': blur_norm, 'conf_margin': conf_margin,
                         'bbox': bbox, 'frame_idx': fidx,
+                        'gdino': gdino_score, 'crop_feat': crop_feat,
                     })
 
             # First pass: check top-N candidates
@@ -574,29 +611,53 @@ class IndexedQueryEngine:
                           if s['clip_score'] >= min_clip_crop and s['combined'] > 0.10]
 
             # ---- Multi-frame consensus ----
-            # Check IoU agreement across top-3 verified frames
+            # Box-IoU agreement (legacy: measures camera motion as much as
+            # agreement) + APPEARANCE consensus: do the top verified crops
+            # look like the same kind of object? (mean pairwise CLIP cosine)
             if len(scored_candidates) >= 2:
                 top3 = sorted(scored_candidates, key=lambda x: x['combined'], reverse=True)[:3]
                 consensus_iou = self._compute_consensus_iou([s['bbox'] for s in top3 if s['bbox'] is not None])
-                print(f"  Multi-frame consensus IoU: {consensus_iou:.3f} "
+                _feats3 = [s.get('crop_feat') for s in top3
+                           if s.get('crop_feat') is not None]
+                if len(_feats3) >= 2:
+                    import itertools
+                    _pair_sims = [float((a @ b.T).squeeze().cpu())
+                                  for a, b in itertools.combinations(_feats3, 2)]
+                    consensus_app = sum(_pair_sims) / len(_pair_sims)
+                print(f"  Multi-frame consensus: IoU={consensus_iou:.3f}, "
+                      f"appearance={consensus_app:.3f} "
                       f"(from {min(3, len(top3))} frames)")
 
-            # Pick the candidate with highest combined score
+            # Pick among verified candidates.
+            # "latest" preserves last-occurrence semantics (episodic memory /
+            # VQ2D): every candidate that passed verification is trusted, so
+            # return the most RECENT one. "best" picks the highest combined
+            # score — which can return an occurrence minutes earlier purely
+            # on score noise (observed: 0.007 score gap = 130s temporal error).
+            verified_selection = self.config.get('text_query', {}).get(
+                'verified_selection', 'latest')
             if scored_candidates:
                 if passed:
-                    best = max(passed, key=lambda x: x['combined'])
+                    if verified_selection == 'latest':
+                        best = max(passed, key=lambda x:
+                                   selected_candidates[x['ci']]['frame_idx'])
+                    else:
+                        best = max(passed, key=lambda x: x['combined'])
                 else:
                     best = max(scored_candidates, key=lambda x: x['combined'])
 
                 best_ci = best['ci']
                 blur_quality = best['blur_norm']
                 confusable_margin = best['conf_margin']
+                best_evidence = best
 
                 if best_ci != 0:
                     old_frame = selected_candidates[0]['frame_idx']
                     selected_candidates = [selected_candidates[best_ci]] + \
                         [c for i, c in enumerate(selected_candidates) if i != best_ci]
-                    tag = "Best verified" if passed else "No clean candidate; best combined"
+                    tag = (("Latest verified" if verified_selection == 'latest'
+                            else "Best verified") if passed
+                           else "No clean candidate; best combined")
                     print(f"  {tag}: frame {selected_candidates[0]['frame_idx']} "
                           f"(combined={best['combined']:.3f}, blur={best['blur_score']:.0f}, "
                           f"was {old_frame})")
@@ -643,6 +704,8 @@ class IndexedQueryEngine:
                     last_meta_idx = i
                     break
 
+        _timing['verify_s'] = round(time.time() - _t_mark, 2)
+        _t_mark = time.time()
         print(f"\n  Best candidate -> frame {last_frame_idx}  "
               f"(t={last_frame_idx/fps:.2f}s, sim={last_sim:.3f})")
 
@@ -694,6 +757,81 @@ class IndexedQueryEngine:
             print(f"  ** CONFUSED: all candidates matched confusable objects better "
                   f"than '{text_query}' -- bbox is best guess but likely wrong **")
 
+        # ---- Multi-instance detection: find ALL matching objects on the
+        # response frame (primary bbox stays instance 0) ----
+        _multi = self.config['text_query'].get('multi_instance', False)
+        _max_inst = int(self.config['text_query'].get('max_instances', 5))
+        instances = [{'bbox': [bx, by, bw, bh],
+                      'score': round(float(region_score), 4)}]
+        if _multi and not is_confused:
+            try:
+                gdino_cfg = self.config.get('grounding_dino', {})
+                _boxes = self.grounding_dino.best_boxes(
+                    frames[center_local],
+                    self._detection_query(text_query),
+                    box_threshold=gdino_cfg.get('box_threshold', 0.30),
+                    text_threshold=gdino_cfg.get('text_threshold', 0.25),
+                    clip_model=self.localizer.clip_model,
+                    clip_preprocess=self.localizer.clip_preprocess,
+                    text_feat=text_feat,
+                    top_k=_max_inst,
+                )
+                # Per-instance confusable suppression: a secondary instance
+                # must also beat the negative classes, not just match the
+                # query (else "pan" happily collects the rice cooker)
+                _plan = self.query_parser.parse(text_query)
+                _conf_names = _plan.confusables
+                _conf_feats = None
+                _tgt_feat = None
+                _margin = self.config.get('text_query', {}).get(
+                    'confusable_margin_delta', 0.03)
+                if _conf_names:
+                    import open_clip
+                    _tokens = open_clip.tokenize(_conf_names).to(self.device)
+                    with torch.no_grad():
+                        _conf_feats = self.localizer.clip_model.encode_text(
+                            _tokens).float()
+                    _conf_feats = F.normalize(_conf_feats, dim=-1)
+                    _tt = open_clip.tokenize([_plan.target]).to(self.device)
+                    with torch.no_grad():
+                        _tgt_feat = self.localizer.clip_model.encode_text(
+                            _tt).float()
+                    _tgt_feat = F.normalize(_tgt_feat, dim=-1)
+
+                # Secondary instances need a minimum score floor too — the
+                # primary went through full verification, these did not
+                # (observed: a bowl of eggs accepted as pan #3 at score 0.11)
+                _min_inst = self.config.get('text_query', {}).get(
+                    'min_crop_verify', 0.17)
+
+                for _bb, _cs, _gs, _lb in _boxes:
+                    if len(instances) >= _max_inst:
+                        break
+                    if any(self.grounding_dino._iou_xywh(_bb, inst['bbox']) >= 0.5
+                           for inst in instances):
+                        continue
+                    _x, _y, _w2, _h2 = [int(v) for v in _bb]
+                    if float(_cs) < _min_inst:
+                        print(f"  instance candidate {[_x, _y, _w2, _h2]} rejected: "
+                              f"score={float(_cs):.3f} < min_crop_verify={_min_inst}")
+                        continue
+                    _crop = frames[center_local][_y:_y+_h2, _x:_x+_w2]
+                    _is_conf, _cscore, _cname, _teff, _cfeat = \
+                        self._confusable_check(
+                            _crop, float(_cs), _conf_names, _conf_feats,
+                            target_feat=_tgt_feat, margin=_margin)
+                    if _is_conf:
+                        print(f"  instance candidate {[_x, _y, _w2, _h2]} rejected: "
+                              f"'{_cname}'={_cscore:.3f} > target={_cs:.3f}")
+                        continue
+                    instances.append({'bbox': [_x, _y, _w2, _h2],
+                                      'score': round(float(_cs), 4)})
+                if len(instances) > 1:
+                    print(f"  Multi-instance: {len(instances)} instance(s) of "
+                          f"'{text_query}' on response frame")
+            except Exception as e:
+                print(f"  Multi-instance detection failed: {e}; keeping primary only")
+
         # Save debug image
         debug_frame = frames[center_local].copy()
         px, py = int(region_point[0]), int(region_point[1])
@@ -736,33 +874,101 @@ class IndexedQueryEngine:
                           (bx + tw + 6, label_y + 4), (0, 0, 0), -1)
             cv2.putText(debug_frame, label, (bx + 3, label_y - 2),
                         font, font_scale, (0, 255, 0), thickness)
+        # Secondary instances in cyan (multi-instance mode)
+        for _k, _inst in enumerate(instances[1:], start=2):
+            _ix, _iy, _iw, _ih = [int(v) for v in _inst['bbox']]
+            cv2.rectangle(debug_frame, (_ix, _iy), (_ix + _iw, _iy + _ih),
+                          (0, 200, 255), 2)
+            cv2.putText(debug_frame, f"#{_k} {_inst['score']:.2f}",
+                        (_ix + 3, max(15, _iy - 6)), font, 0.55, (0, 200, 255), 2)
         debug_path = os.path.join(output_dir, 'debug_last_frame.jpg')
         cv2.imwrite(debug_path, cv2.cvtColor(debug_frame, cv2.COLOR_RGB2BGR))
         print(f"  Debug frame saved: {debug_path}")
 
-        # ---- SAM2 Tracking or single-frame export ----
-        _skip_sam2 = self.config['text_query'].get('skip_sam2_eval', True)
+        # ---- Evidence fusion: presence posterior (Contribution C) ----
+        # All verification signals fuse into ONE calibrated decision —
+        # computed BEFORE tracking so abstention short-circuits the most
+        # expensive stage (observed: 7 min spent tracking a nonexistent
+        # "zebra" because the decision came after tracking).
+        try:
+            _s_ret = float((last_sim - float(all_sims.mean()))
+                           / (float(all_sims.std()) + 1e-6))
+        except Exception:
+            _s_ret = 0.0
+        _frame_area = float(max(1, frames[0].shape[0] * frames[0].shape[1]))
+        evidence = EvidenceVector(
+            s_clip=float(best_evidence['clip_score']) if best_evidence else float(last_sim),
+            s_patch=float(best_evidence['patch_score']) if best_evidence else 0.0,
+            m_conf=float(confusable_margin),
+            q_blur=float(blur_quality),
+            c_app=float(consensus_app),
+            s_gdino=float(best_evidence.get('gdino', 0.0)) if best_evidence else 0.0,
+            s_ret=_s_ret,
+            a_frac=float(bw * bh) / _frame_area,
+            s_reid=0.0,  # populated by exemplar re-ID (Contribution A, 1.5)
+        )
+        presence = self.presence_model.presence(evidence)
+        tau_abstain = self.config['text_query'].get('tau_abstain', 0.2)
+        tau_accept = self.config['text_query'].get('tau_accept', 0.5)
+        decision = ('not_found' if presence < tau_abstain
+                    else 'uncertain' if presence < tau_accept
+                    else 'found')
+        if presence < tau_abstain:
+            print(f"\n  Presence p={presence:.3f} < tau_abstain={tau_abstain} "
+                  f"-> NOT FOUND (calibrated abstention)")
+        elif presence < tau_accept:
+            print(f"\n  Presence p={presence:.3f} in uncertainty zone "
+                  f"[{tau_abstain}, {tau_accept}) -> candidate for "
+                  f"plan refinement (1.6)")
+        else:
+            print(f"\n  Presence p={presence:.3f} >= tau_accept={tau_accept} "
+                  f"-> FOUND")
 
+        # ---- SAM2 Tracking or single-frame export ----
+        # Detect once, then ONE SAM2 track per instance across the window
+        _skip_sam2 = self.config['text_query'].get('skip_sam2_eval', True)
+        if presence < tau_abstain and not _skip_sam2:
+            print("  Skipping SAM2 tracking — presence below abstention "
+                  "threshold (no point tracking an absent object)")
+            _skip_sam2 = True
+        _timing['localize_s'] = round(time.time() - _t_mark, 2)
+        _t_mark = time.time()
+        # Masks (COCO RLE) are only encoded when a JSON export is requested
+        _save_masks = (json_out is not None) and \
+            self.config['text_query'].get('save_masks', True)
+
+        all_tracks = []
         if not _skip_sam2:
-            # Detect once, track with SAM2 across the context window
-            print(f"\n  SAM2 tracking from seed bbox {[bx, by, bw, bh]} on frame {last_frame_idx}...")
+            _seeds = [[int(v) for v in _inst['bbox']] for _inst in instances]
+            print(f"\n  SAM2 tracking {len(_seeds)} instance(s) in ONE session "
+                  f"from frame {last_frame_idx}...")
             try:
-                track = self.localizer.track_from_bbox(
-                    frames, center_local,
-                    torch.tensor([bx, by, bw, bh]),
+                all_tracks = self.localizer.track_from_bboxes(
+                    frames, center_local, _seeds,
                     half_span=len(frames) // 2,
+                    return_masks=_save_masks,
                 )
                 # Remap local frame indices back to global
-                for t in track:
-                    local_idx = t['frame_idx']
-                    if local_idx < len(frame_indices):
-                        t['frame_idx'] = frame_indices[local_idx]
-                print(f"  SAM2 tracked {len(track)} frames with bbox")
+                for _tr in all_tracks:
+                    for t in _tr:
+                        local_idx = t['frame_idx']
+                        if local_idx < len(frame_indices):
+                            t['frame_idx'] = frame_indices[local_idx]
+                print("  SAM2 tracked: " + ", ".join(
+                    f"{len(_tr)} frames (instance {_i})"
+                    for _i, _tr in enumerate(all_tracks)))
             except Exception as e:
-                print(f"  SAM2 tracking failed: {e}, using single-frame bbox")
-                track = [{'frame_idx': last_frame_idx, 'bbox': [bx, by, bw, bh]}]
+                print(f"  SAM2 tracking failed: {e}, using single-frame bbox(es)")
+                all_tracks = [[{'frame_idx': last_frame_idx, 'bbox': _s}]
+                              for _s in _seeds]
         else:
-            track = [{'frame_idx': last_frame_idx, 'bbox': [bx, by, bw, bh]}]
+            all_tracks = [[{'frame_idx': last_frame_idx,
+                            'bbox': [int(v) for v in _inst['bbox']]}]
+                          for _inst in instances]
+        # Primary instance renders the result clip (multi-track export in 1.4)
+        track = all_tracks[0]
+
+        _timing['track_s'] = round(time.time() - _t_mark, 2)
 
         print("\nExporting result clip...")
         self.localizer.export_clip(
@@ -770,6 +976,21 @@ class IndexedQueryEngine:
             fps, os.path.join(output_dir, 'last_occurrence.mp4'),
             context_seconds=context_seconds,
         )
+        _timing['total_s'] = round(time.time() - _t_start, 2)
+
+        # Run provenance: which config and code produced these numbers
+        _config_hash = hashlib.md5(
+            json.dumps(self.config, sort_keys=True, default=str).encode()
+        ).hexdigest()[:8]
+        try:
+            import subprocess
+            _git_hash = subprocess.check_output(
+                ['git', 'rev-parse', '--short', 'HEAD'],
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except Exception:
+            _git_hash = None
 
         result = {
             'query': text_query,
@@ -777,8 +998,15 @@ class IndexedQueryEngine:
             'last_frame_idx': last_frame_idx,
             'last_frame_timestamp': round(last_frame_idx / fps, 3),
             'pred_bbox': [bx, by, bw, bh],
+            'num_instances': len(instances),
+            'instances': instances,
+            'tracked_frames_per_instance': [len(t) for t in all_tracks],
             'confused': is_confused,
             'confidence': round(confidence_score, 4),
+            'presence': round(presence, 4),
+            'found': bool(presence >= tau_abstain),
+            'decision': decision,
+            'evidence': evidence.to_dict(),
             'clip_similarity': round(float(clip_sims[last_meta_idx]), 4),
             'fused_similarity': round(last_sim, 4),
             'region_point': list(region_point),
@@ -791,9 +1019,54 @@ class IndexedQueryEngine:
             'frames_above_threshold': int(n_above),
             'context_seconds': context_seconds,
             'fps': fps,
+            'timing': _timing,
+            'config_hash': _config_hash,
+            'git_hash': _git_hash,
         }
         with open(os.path.join(output_dir, 'result.json'), 'w') as f:
             json.dump(result, f, indent=2)
+
+        # ---- Full machine-readable export (benchmark adapters read this) ----
+        if json_out:
+            full = {
+                'query': text_query,
+                'plan': self.query_parser.parse(text_query).to_dict(),
+                'found': bool(presence >= tau_abstain),
+                'decision': decision,
+                'presence': round(presence, 4),
+                'confidence': round(confidence_score, 4),
+                # Evidence vector — the dataset for presence-model fitting
+                # (Phase 4 dev labels) and the ROC abstention figure
+                'evidence': evidence.to_dict(),
+                'last_frame_idx': last_frame_idx,
+                'last_frame_timestamp': round(last_frame_idx / fps, 3),
+                'temporal_window_s': [
+                    round(max(0.0, last_frame_idx / fps - context_seconds / 2), 3),
+                    round(last_frame_idx / fps + context_seconds / 2, 3),
+                ],
+                'tracks': [
+                    {
+                        'instance_id': i,
+                        'source': 'text',
+                        'seed_bbox': instances[i]['bbox'],
+                        'score': instances[i]['score'],
+                        'num_frames': len(tr),
+                        'frames': tr,
+                    }
+                    for i, tr in enumerate(all_tracks)
+                ],
+                'timing': _timing,
+                'config_hash': _config_hash,
+                'git_hash': _git_hash,
+                'video_path': video_path,
+                'fps': fps,
+            }
+            _json_dir = os.path.dirname(json_out)
+            if _json_dir:
+                os.makedirs(_json_dir, exist_ok=True)
+            with open(json_out, 'w') as f:
+                json.dump(full, f, indent=2)
+            print(f"  Full JSON export: {json_out}")
 
         return result
 
@@ -812,16 +1085,27 @@ class IndexedQueryEngine:
         target_clip_score: float,
         confusable_names: list,
         confusable_feats: torch.Tensor,
+        target_feat: torch.Tensor = None,
+        margin: float = 0.0,
     ) -> Tuple[bool, float, str]:
         """
         Check if a detection crop is more similar to a confusable class
         than to the target query.
 
+        target_feat: CLIP text embedding of the DISAMBIGUATED target phrase
+        (e.g. "frying pan"). The raw query ("pan") is a vague single word
+        and systematically loses to specific confusable phrases ("pot lid")
+        on the same crop — scoring both sides with specific phrases makes
+        the comparison fair. The higher of raw/disambiguated is used.
+
+        margin: required winning margin before rejecting. CLIP similarity
+        differences below ~0.03 are noise for near-synonym categories.
+
         Returns (is_confused, max_confusable_score, worst_confusable_name).
         is_confused=True means the crop matched a confusable better.
         """
         if confusable_feats is None or crop_rgb.size == 0:
-            return False, 0.0, ""
+            return False, 0.0, "", target_clip_score, None
 
         crop_t = self.localizer.clip_preprocess(
             Image.fromarray(crop_rgb)
@@ -838,9 +1122,16 @@ class IndexedQueryEngine:
         max_conf = float(sims[max_idx])
         worst_name = confusable_names[max_idx]
 
-        # Confused if the best confusable score exceeds the target score
-        is_confused = max_conf > target_clip_score
-        return is_confused, max_conf, worst_name
+        # Score the SAME crop against the disambiguated target phrase
+        if target_feat is not None:
+            t_spec = float((crop_feat @ target_feat.T).squeeze().cpu())
+            target_clip_score = max(target_clip_score, t_spec)
+
+        # Confused only if the best confusable wins by more than the margin
+        is_confused = max_conf > target_clip_score + margin
+        # Also return the effective target score (for honest margin logging)
+        # and the crop embedding (reused for appearance consensus)
+        return is_confused, max_conf, worst_name, target_clip_score, crop_feat
 
     # ------------------------------------------------------------------ #
     # Patch-level spatial verification                                     #
@@ -1202,6 +1493,10 @@ def main():
                         help='Comma-separated negative prompts to suppress confounders')
     parser.add_argument('--neg-weight', type=float, default=None, dest='neg_weight',
                         help='Weight for negative prompt suppression (default: from config)')
+    parser.add_argument('--json-out', type=str, default=None, dest='json_out',
+                        help='Write full machine-readable result (plan, evidence, '
+                             'per-instance tracks with COCO RLE masks, timing) to '
+                             'this path — benchmark adapters consume this file')
 
     args = parser.parse_args()
 
@@ -1226,6 +1521,7 @@ def main():
         threshold=args.threshold,
         neg_queries=neg_queries,
         neg_weight=args.neg_weight,
+        json_out=args.json_out,
     )
 
     print("\n=== Query Complete ===")

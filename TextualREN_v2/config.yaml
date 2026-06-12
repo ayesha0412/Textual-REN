@@ -3,10 +3,19 @@ data:
 
 text_query:
   similarity_threshold: 0.18   # CLIP cosine similarity cutoff for candidate frames
-  context_seconds: 0.5          # ±N/2 seconds temporal window for Stage 4
+  context_seconds: 6.0          # ±3 seconds temporal window for Stage 4
   frame_sample_rate: 10         # process every Nth frame for CLIP retrieval (1 = all)
   min_crop_verify: 0.17         # min CLIP crop score to accept a candidate frame as valid
   neg_weight: 0.25              # weight for negative prompts (0 = disabled)
+  confusable_margin_delta: 0.03 # confusable must WIN by this margin to reject
+                                # (CLIP sims closer than ~0.03 are noise)
+
+  # Evidence fusion (Contribution C): all verification signals fuse into one
+  # presence posterior p = sigma(w·f + b); weights fit ONCE on dev, frozen
+  presence_weights: 'configs/presence_weights.json'
+  tau_accept: 0.5               # p >= accept -> confident FOUND
+  tau_abstain: 0.2              # p < abstain -> NOT FOUND (calibrated abstention)
+                                # between the two -> refinement zone (1.6)
   # If the final segment is weak, fall back to the strongest segment instead.
   last_segment_min_peak: 0.18   # absolute min peak to trust the last segment (= threshold)
   last_segment_min_rel: 0.60    # or relative to global peak (last >= rel * global)
@@ -17,6 +26,9 @@ text_query:
 
   # RELOCATE Stage 3: Selection Policy
   selection_policy: "last"      # "last", "strongest", "topk", "topp"
+  verified_selection: "latest"  # among verification-PASSING candidates:
+                                # "latest" = most recent (episodic/VQ2D semantics)
+                                # "best"   = highest combined score (legacy v3)
   selection_top_k: 10           # For topk/topp mode
   selection_top_p: 0.9          # Nucleus sampling threshold
   nms_threshold: 0.5            # Inter-frame NMS: suppress within 0.5s
@@ -27,8 +39,15 @@ text_query:
 
   # SAM2 settings
   sam_inference_size: 512       # 1024 = full quality, 768/512 = faster with similar masks
-  skip_sam2_eval: true          # fast mode — use GDino bbox directly
+  skip_sam2_eval: false         # SAM2 tracks object across context window
   cache_sam_results: true
+
+  # Multi-instance: detect ALL matching objects on the response frame,
+  # one SAM2 track per instance (primary instance renders the result clip)
+  multi_instance: true
+  max_instances: 5
+  save_masks: true              # encode SAM2 masks as COCO RLE in --json-out exports
+                                # (EgoMask metrics are mask-level)
 
   # Spatial localization method for Stage 5 (bbox detection)
   # "grounding_dino" — text-conditioned detection, training-free (recommended)
@@ -44,7 +63,9 @@ text_query:
   blur_threshold: 50.0            # < 50 = severe motion blur
 
   # Query parser: "rule_based" (fast, no deps) or "llm" (local open-source model)
-  query_parser: "rule_based"
+  query_parser: "llm"
+  use_ontology: true              # ontology = warm cache of pre-verified plans;
+                                  # false = every query goes through the LLM (ablation)
   # LLM settings (only used when query_parser: "llm")
   llm_backend: "transformers"      # "transformers" (recommended) or "ollama"
   llm_model: "Qwen/Qwen3-0.6B"   # transformers: Qwen/Qwen3-0.6B (0.6B, ~1.2GB VRAM)
