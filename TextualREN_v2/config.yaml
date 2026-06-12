@@ -12,6 +12,9 @@ text_query:
   min_clean_margin: 0.02        # target must WIN by this margin for a candidate
                                 # to be eligible as the response (tie-band passers
                                 # remain fallback only); interim until fitted weights
+  universal_negatives: true     # margins also computed against COCO-80 names —
+                                # keeps margins honest when the LLM's own
+                                # negatives are nonsense (domain-general)
 
   # Evidence fusion (Contribution C): all verification signals fuse into one
   # presence posterior p = sigma(w·f + b); weights fit ONCE on dev, frozen
@@ -19,6 +22,13 @@ text_query:
   tau_accept: 0.5               # p >= accept -> confident FOUND
   tau_abstain: 0.2              # p < abstain -> NOT FOUND (calibrated abstention)
                                 # between the two -> refinement zone (1.6)
+
+  # Plan refinement (Contribution B): when the preliminary presence lands in
+  # the uncertainty zone, verifier feedback (near-tie look-alike, margin,
+  # tried prompts) goes back to the LLM, which revises the plan; recent
+  # passing candidates are re-verified under it. Test-time scaling, capped.
+  plan_refinement: true
+  max_refine_iters: 2
 
   # Exemplar re-ID (Contribution A): the verified detection bootstraps an
   # instance-level exemplar bank (DINOv2) that sweeps the index for every

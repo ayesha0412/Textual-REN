@@ -293,6 +293,7 @@ class IndexedQueryEngine:
         self.presence_model = PresenceModel(_pw)
 
         self._exemplar_reid = None  # lazy (Contribution A)
+        self._plan_override = None  # refined plan for current query (Contribution B)
 
         self.index_dir = index_dir
         self._load_index()
@@ -387,6 +388,7 @@ class IndexedQueryEngine:
 
         _t_start = time.time()
         _timing = {}
+        self._plan_override = None  # fresh per query
 
         # ---- Stage 1: encode text query ----
         print(f"\nQuery: '{text_query}'")
@@ -460,6 +462,7 @@ class IndexedQueryEngine:
         confusable_margin = 0.0
         consensus_app = 0.0       # appearance consensus (CLIP-crop cosine)
         best_evidence = None      # best candidate's raw signals for fusion
+        refine_history = []       # presence per refinement iteration (B)
         _timing['retrieve_s'] = round(time.time() - _t_start, 2)
         _t_mark = time.time()
 
@@ -471,10 +474,12 @@ class IndexedQueryEngine:
             blur_threshold = self.config.get('text_query', {}).get('blur_threshold', 50.0)
             max_verify = min(len(selected_candidates), 12)
 
-            # Use query parser for detection prompt + confusables
+            # Use query parser for detection prompt + confusables,
+            # augmented with the universal negative pool
             query_plan = self.query_parser.parse(text_query)
             det_query = query_plan.detection_prompt
-            conf_names = query_plan.confusables
+            conf_names = self._augmented_negatives(
+                query_plan.confusables, query_plan.target, text_query)
 
             # Pre-encode confusable class texts for negative suppression,
             # plus the disambiguated target phrase for a fair comparison
@@ -502,7 +507,9 @@ class IndexedQueryEngine:
             if det_query != text_query:
                 print(f"  Detection query: '{det_query}'")
             if conf_names:
-                print(f"  Confusable classes: {conf_names}")
+                _n_uni = len(conf_names) - len(query_plan.confusables)
+                print(f"  Confusable classes: {query_plan.confusables} "
+                      f"+ {_n_uni} universal negatives")
 
             # Score every candidate
             already_checked = set()
@@ -546,6 +553,7 @@ class IndexedQueryEngine:
                     confused = False
                     conf_margin = clip_score  # margin = target - max_confusable
                     crop_feat = None
+                    conf_name = ''
                     if conf_feats is not None:
                         bx, by, bw, bh = bbox
                         crop = probe[by:by+bh, bx:bx+bw]
@@ -598,6 +606,7 @@ class IndexedQueryEngine:
                         'blur_norm': blur_norm, 'conf_margin': conf_margin,
                         'bbox': bbox, 'frame_idx': fidx,
                         'gdino': gdino_score, 'crop_feat': crop_feat,
+                        'conf_name': conf_name,
                     })
 
             # First pass: check top-N candidates
@@ -682,6 +691,139 @@ class IndexedQueryEngine:
                           f"(combined={best['combined']:.3f}, {tag})")
             else:
                 print(f"  GDino found nothing on any candidate; keeping original")
+
+            # ---- Contribution B: verifier-guided plan refinement ----
+            # Preliminary presence from verification-stage evidence decides
+            # whether to spend LLM + detector budget revising the plan,
+            # BEFORE committing to context loading / localization / tracking.
+            _refine_on = (self.config['text_query'].get('plan_refinement', True)
+                          and self.query_parser.mode == 'llm')
+            _max_ref = int(self.config['text_query'].get('max_refine_iters', 2))
+            if _refine_on and best_evidence is not None:
+                _t_ref = time.time()
+                _tau_ab = self.config['text_query'].get('tau_abstain', 0.2)
+                _tau_ac = self.config['text_query'].get('tau_accept', 0.5)
+
+                def _prelim_presence(b):
+                    return self.presence_model.presence(EvidenceVector(
+                        s_clip=float(b['clip_score']),
+                        s_patch=float(b['patch_score']),
+                        m_conf=float(b['conf_margin']),
+                        q_blur=float(b['blur_norm']),
+                        c_app=float(consensus_app),
+                        s_gdino=float(b.get('gdino', 0.0)),
+                    ))
+
+                _p = _prelim_presence(best_evidence)
+                refine_history.append(round(_p, 4))
+                _cur_plan = query_plan
+                _it = 0
+                while _it < _max_ref and _tau_ab <= _p < _tau_ac:
+                    _it += 1
+                    feedback = {
+                        'presence': round(_p, 4),
+                        'issue': ('target barely outscored a look-alike'
+                                  if best_evidence['conf_margin'] < 0.05
+                                  else 'low detection confidence'),
+                        'near_tie_lookalike': best_evidence.get('conf_name', ''),
+                        'margin': round(float(best_evidence['conf_margin']), 4),
+                        'tried_detection_prompts':
+                            _cur_plan.detection_prompt.split('. '),
+                        'frame_blur': round(float(best_evidence['blur_norm']), 3),
+                    }
+                    print(f"\n  [Refine {_it}/{_max_ref}] presence {_p:.3f} in "
+                          f"uncertainty zone -- asking LLM to revise the plan...")
+                    refined = self.query_parser.refine_plan(_cur_plan, feedback)
+                    if refined is None:
+                        print("  [Refine] LLM revision unavailable; stopping")
+                        break
+                    print(f"  [Refine] detection query: '{refined.detection_prompt}'")
+                    print(f"  [Refine] confusables: {refined.confusables}")
+                    _cur_plan = refined
+                    self._plan_override = refined
+                    det_query = refined.detection_prompt
+                    conf_names = self._augmented_negatives(
+                        refined.confusables, refined.target, text_query)
+                    if conf_names:
+                        import open_clip
+                        _tk = open_clip.tokenize(conf_names).to(self.device)
+                        with torch.no_grad():
+                            conf_feats = F.normalize(
+                                self.localizer.clip_model.encode_text(_tk).float(),
+                                dim=-1)
+                        _tt = open_clip.tokenize([refined.target]).to(self.device)
+                        with torch.no_grad():
+                            target_conf_feat = F.normalize(
+                                self.localizer.clip_model.encode_text(_tt).float(),
+                                dim=-1)
+
+                    # Re-verify recent passing frames under the revised plan
+                    _recheck = sorted(passed, key=lambda s: -s['frame_idx'])[:6] \
+                        or scored_candidates[:6]
+                    _rescored = []
+                    for s in _recheck:
+                        fidx = s['frame_idx']
+                        try:
+                            probe = self._load_single_frame(video_path, fidx)
+                        except Exception:
+                            continue
+                        boxes = self.grounding_dino.best_boxes(
+                            probe, det_query,
+                            box_threshold=box_thresh, text_threshold=text_thresh,
+                            clip_model=self.localizer.clip_model,
+                            clip_preprocess=self.localizer.clip_preprocess,
+                            text_feat=text_feat, top_k=1,
+                        )
+                        if not boxes:
+                            continue
+                        _bb, _cl, _gd, _ = boxes[0]
+                        _x, _y, _w, _h = _bb
+                        _cr = probe[_y:_y+_h, _x:_x+_w]
+                        _ic, _cs2, _cn2, _te2, _ = self._confusable_check(
+                            _cr, _cl, conf_names, conf_feats,
+                            target_feat=target_conf_feat,
+                            margin=conf_margin_delta)
+                        _m2 = _te2 - _cs2
+                        n = dict(s)
+                        n.update({'clip_score': _cl, 'conf_margin': _m2,
+                                  'conf_name': _cn2, 'gdino': _gd, 'bbox': _bb,
+                                  'confused': _ic,
+                                  'combined': (0.5*_cl + 0.3*s['patch_score']
+                                               + 0.2*s['blur_norm'])
+                                              * (0.3 if _ic else 1.0)})
+                        print(f"    [Refine] frame {fidx}: CLIP={_cl:.3f} "
+                              f"marg={_m2:+.3f}{' CONFUSED' if _ic else ''}")
+                        _rescored.append(n)
+
+                    _ok = [s for s in _rescored
+                           if not s['confused'] and s['clip_score'] >= min_clip_crop]
+                    _cl2 = [s for s in _ok
+                            if s['conf_margin'] >= min_clean_margin]
+                    _pool = _cl2 or _ok
+                    if not _pool:
+                        print("  [Refine] no candidate survived the revised plan")
+                        refine_history.append(round(_p, 4))
+                        continue
+                    if verified_selection == 'latest':
+                        _nb = max(_pool, key=lambda x: x['frame_idx'])
+                    else:
+                        _nb = max(_pool, key=lambda x: x['combined'])
+                    best_evidence = _nb
+                    blur_quality = _nb['blur_norm']
+                    confusable_margin = _nb['conf_margin']
+                    _pos = next((i for i, c in enumerate(selected_candidates)
+                                 if c['frame_idx'] == _nb['frame_idx']), 0)
+                    if _pos != 0:
+                        selected_candidates = [selected_candidates[_pos]] + \
+                            [c for i, c in enumerate(selected_candidates)
+                             if i != _pos]
+                        print(f"  [Refine] response moved to frame "
+                              f"{_nb['frame_idx']}")
+                    _p = _prelim_presence(_nb)
+                    refine_history.append(round(_p, 4))
+                    print(f"  [Refine] presence {refine_history[-2]:.3f} -> "
+                          f"{_p:.3f}")
+                _timing['refine_s'] = round(time.time() - _t_ref, 2)
 
         # ---- Confidence score ----
         # Calibrated confidence combining all signals
@@ -795,7 +937,8 @@ class IndexedQueryEngine:
                 # must also beat the negative classes, not just match the
                 # query (else "pan" happily collects the rice cooker)
                 _plan = self.query_parser.parse(text_query)
-                _conf_names = _plan.confusables
+                _conf_names = self._augmented_negatives(
+                    _plan.confusables, _plan.target, text_query)
                 _conf_feats = None
                 _tgt_feat = None
                 _margin = self.config.get('text_query', {}).get(
@@ -847,11 +990,57 @@ class IndexedQueryEngine:
             except Exception as e:
                 print(f"  Multi-instance detection failed: {e}; keeping primary only")
 
+        # ---- Evidence fusion: presence posterior (Contribution C) ----
+        # Computed BEFORE the debug rendering and tracking: the visual output
+        # must reflect the decision (an abstained query gets NO box — drawing
+        # a confident rectangle for an absent object misleads), and abstention
+        # short-circuits the most expensive stage.
+        try:
+            _s_ret = float((last_sim - float(all_sims.mean()))
+                           / (float(all_sims.std()) + 1e-6))
+        except Exception:
+            _s_ret = 0.0
+        _frame_area = float(max(1, frames[0].shape[0] * frames[0].shape[1]))
+        evidence = EvidenceVector(
+            s_clip=float(best_evidence['clip_score']) if best_evidence else float(last_sim),
+            s_patch=float(best_evidence['patch_score']) if best_evidence else 0.0,
+            m_conf=float(confusable_margin),
+            q_blur=float(blur_quality),
+            c_app=float(consensus_app),
+            s_gdino=float(best_evidence.get('gdino', 0.0)) if best_evidence else 0.0,
+            s_ret=_s_ret,
+            a_frac=float(bw * bh) / _frame_area,
+            s_reid=0.0,  # populated by exemplar re-ID (Contribution A, 1.5)
+        )
+        presence = self.presence_model.presence(evidence)
+        tau_abstain = self.config['text_query'].get('tau_abstain', 0.2)
+        tau_accept = self.config['text_query'].get('tau_accept', 0.5)
+        decision = ('not_found' if presence < tau_abstain
+                    else 'uncertain' if presence < tau_accept
+                    else 'found')
+        if presence < tau_abstain:
+            print(f"\n  Presence p={presence:.3f} < tau_abstain={tau_abstain} "
+                  f"-> NOT FOUND (calibrated abstention)")
+        elif presence < tau_accept:
+            print(f"\n  Presence p={presence:.3f} in uncertainty zone "
+                  f"[{tau_abstain}, {tau_accept}) -> candidate for "
+                  f"plan refinement (1.6)")
+        else:
+            print(f"\n  Presence p={presence:.3f} >= tau_accept={tau_accept} "
+                  f"-> FOUND")
+
         # Save debug image
         debug_frame = frames[center_local].copy()
         px, py = int(region_point[0]), int(region_point[1])
         font = cv2.FONT_HERSHEY_SIMPLEX
-        if is_confused:
+        if decision == 'not_found':
+            # Abstained: banner only, no box, no region point
+            _msg = f"NOT FOUND: '{text_query}' (presence={presence:.2f})"
+            cv2.rectangle(debug_frame, (0, 0), (debug_frame.shape[1], 48),
+                          (0, 0, 0), -1)
+            cv2.putText(debug_frame, _msg, (12, 34), font, 0.9,
+                        (255, 90, 90), 2)
+        elif is_confused:
             # Red bbox + CONFUSED label for uncertain results
             bbox_color = (255, 0, 0)   # Red in RGB
             cv2.circle(debug_frame, (px, py), 8, (255, 0, 0), 2)
@@ -890,7 +1079,8 @@ class IndexedQueryEngine:
             cv2.putText(debug_frame, label, (bx + 3, label_y - 2),
                         font, font_scale, (0, 255, 0), thickness)
         # Secondary instances in cyan (multi-instance mode)
-        for _k, _inst in enumerate(instances[1:], start=2):
+        for _k, _inst in enumerate(instances[1:] if decision != 'not_found'
+                                    else [], start=2):
             _ix, _iy, _iw, _ih = [int(v) for v in _inst['bbox']]
             cv2.rectangle(debug_frame, (_ix, _iy), (_ix + _iw, _iy + _ih),
                           (0, 200, 255), 2)
@@ -899,45 +1089,6 @@ class IndexedQueryEngine:
         debug_path = os.path.join(output_dir, 'debug_last_frame.jpg')
         cv2.imwrite(debug_path, cv2.cvtColor(debug_frame, cv2.COLOR_RGB2BGR))
         print(f"  Debug frame saved: {debug_path}")
-
-        # ---- Evidence fusion: presence posterior (Contribution C) ----
-        # All verification signals fuse into ONE calibrated decision —
-        # computed BEFORE tracking so abstention short-circuits the most
-        # expensive stage (observed: 7 min spent tracking a nonexistent
-        # "zebra" because the decision came after tracking).
-        try:
-            _s_ret = float((last_sim - float(all_sims.mean()))
-                           / (float(all_sims.std()) + 1e-6))
-        except Exception:
-            _s_ret = 0.0
-        _frame_area = float(max(1, frames[0].shape[0] * frames[0].shape[1]))
-        evidence = EvidenceVector(
-            s_clip=float(best_evidence['clip_score']) if best_evidence else float(last_sim),
-            s_patch=float(best_evidence['patch_score']) if best_evidence else 0.0,
-            m_conf=float(confusable_margin),
-            q_blur=float(blur_quality),
-            c_app=float(consensus_app),
-            s_gdino=float(best_evidence.get('gdino', 0.0)) if best_evidence else 0.0,
-            s_ret=_s_ret,
-            a_frac=float(bw * bh) / _frame_area,
-            s_reid=0.0,  # populated by exemplar re-ID (Contribution A, 1.5)
-        )
-        presence = self.presence_model.presence(evidence)
-        tau_abstain = self.config['text_query'].get('tau_abstain', 0.2)
-        tau_accept = self.config['text_query'].get('tau_accept', 0.5)
-        decision = ('not_found' if presence < tau_abstain
-                    else 'uncertain' if presence < tau_accept
-                    else 'found')
-        if presence < tau_abstain:
-            print(f"\n  Presence p={presence:.3f} < tau_abstain={tau_abstain} "
-                  f"-> NOT FOUND (calibrated abstention)")
-        elif presence < tau_accept:
-            print(f"\n  Presence p={presence:.3f} in uncertainty zone "
-                  f"[{tau_abstain}, {tau_accept}) -> candidate for "
-                  f"plan refinement (1.6)")
-        else:
-            print(f"\n  Presence p={presence:.3f} >= tau_accept={tau_accept} "
-                  f"-> FOUND")
 
         # ---- SAM2 Tracking or single-frame export ----
         # Detect once, then ONE SAM2 track per instance across the window
@@ -1091,12 +1242,15 @@ class IndexedQueryEngine:
 
         _timing['track_s'] = round(time.time() - _t_mark, 2)
 
-        print("\nExporting result clip...")
-        self.localizer.export_clip(
-            video_path, track, last_frame_idx,
-            fps, os.path.join(output_dir, 'last_occurrence.mp4'),
-            context_seconds=context_seconds,
-        )
+        if decision == 'not_found':
+            print("\n  Result clip export skipped (NOT FOUND)")
+        else:
+            print("\nExporting result clip...")
+            self.localizer.export_clip(
+                video_path, track, last_frame_idx,
+                fps, os.path.join(output_dir, 'last_occurrence.mp4'),
+                context_seconds=context_seconds,
+            )
         _timing['total_s'] = round(time.time() - _t_start, 2)
 
         # Run provenance: which config and code produced these numbers
@@ -1129,6 +1283,8 @@ class IndexedQueryEngine:
             'found': bool(presence >= tau_abstain),
             'decision': decision,
             'evidence': evidence.to_dict(),
+            'refine_history': refine_history,
+            'refine_iters': max(0, len(refine_history) - 1),
             'clip_similarity': round(float(clip_sims[last_meta_idx]), 4),
             'fused_similarity': round(last_sim, 4),
             'region_point': list(region_point),
@@ -1157,6 +1313,8 @@ class IndexedQueryEngine:
                 'decision': decision,
                 'presence': round(presence, 4),
                 'confidence': round(confidence_score, 4),
+                'refine_history': refine_history,
+                'refine_iters': max(0, len(refine_history) - 1),
                 # Evidence vector — the dataset for presence-model fitting
                 # (Phase 4 dev labels) and the ROC abstention figure
                 'evidence': evidence.to_dict(),
@@ -1208,9 +1366,55 @@ class IndexedQueryEngine:
     # ------------------------------------------------------------------ #
 
     def _detection_query(self, text_query: str) -> str:
-        """Expand query for Grounding DINO detection via QueryParser."""
+        """Expand query for Grounding DINO detection via QueryParser.
+
+        A refined plan (Contribution B) overrides the cached one so every
+        later stage (localization, multi-instance, re-ID) uses the revision.
+        """
+        if (self._plan_override is not None
+                and self._plan_override.original_query == text_query):
+            return self._plan_override.detection_prompt
         plan = self.query_parser.parse(text_query)
         return plan.detection_prompt
+
+    # Universal negative pool (COCO-80 class names). Margins are only
+    # meaningful against negatives plausibly present in the scene; a small
+    # LLM's imagined negatives can be nonsense ("thundermole", "cinderblock"),
+    # which makes margins vacuously wide and blinds the refinement gate.
+    # A standing, domain-general vocabulary keeps the reference set honest.
+    _UNIVERSAL_NEGATIVES = [
+        'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
+        'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
+        'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep',
+        'cow', 'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella',
+        'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard',
+        'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard',
+        'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup', 'fork',
+        'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+        'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+        'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv',
+        'laptop', 'mouse', 'remote', 'keyboard', 'cell phone', 'microwave',
+        'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase',
+        'scissors', 'toothbrush', 'hair drier', 'teddy bear',
+    ]
+
+    def _augmented_negatives(self, conf_names: list, target: str,
+                             raw_query: str) -> list:
+        """LLM/ontology negatives ∪ universal pool, minus target-like terms."""
+        out = list(conf_names or [])
+        if not self.config.get('text_query', {}).get('universal_negatives', True):
+            return out
+        t, q = target.lower(), raw_query.lower()
+        seen = {c.lower() for c in out}
+        for c in self._UNIVERSAL_NEGATIVES:
+            cl = c.lower()
+            if cl in seen:
+                continue
+            # never use the target (or a sub/super-string of it) as a negative
+            if cl in t or t in cl or cl in q or q in cl:
+                continue
+            out.append(c)
+        return out
 
     def _confusable_check(
         self,
