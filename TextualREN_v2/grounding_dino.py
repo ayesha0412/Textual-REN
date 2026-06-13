@@ -132,7 +132,14 @@ class GroundingDINOLocalizer:
         if n_filtered > 0:
             print(f"  [size filter] removed {n_filtered} oversized detection(s) "
                   f"(>{max_area_frac*100:.0f}% of frame)")
-        detections = sized if sized else detections  # keep originals as fallback
+        # If EVERY detection is oversized, return nothing rather than the
+        # rejected giants — a box covering >max_area_frac of an egocentric
+        # frame is a scene-level false positive, and surfacing it poisons the
+        # crop score and area evidence. Empty -> evidence collapses ->
+        # abstention decides (the correct outcome for an absent object).
+        detections = sized
+        if not detections:
+            return []
 
         # Score every crop with CLIP (if available) so ranking is semantic
         if clip_model is not None and text_feat is not None:
