@@ -36,26 +36,16 @@ class GroundingDINOLocalizer:
             self._model.cpu()
             torch.cuda.empty_cache()
 
-    def detect(
+    def _detect_single(
         self,
-        frame_rgb: np.ndarray,
-        text_query: str,
-        box_threshold: float = 0.30,
-        text_threshold: float = 0.25,
+        image: Image.Image,
+        query: str,
+        box_threshold: float,
+        text_threshold: float,
+        offset_x: int = 0,
+        offset_y: int = 0,
     ) -> List[Tuple[List[int], float, str]]:
-        """
-        Detect objects matching text_query in a frame.
-
-        Returns list of (bbox_xywh, confidence, label) sorted by confidence desc.
-        bbox_xywh is [x, y, w, h] in pixel coordinates.
-        """
-        self._load()
-        self._model.to(self.device)
-
-        image = Image.fromarray(frame_rgb)
-        # Grounding DINO expects the query to end with a period
-        query = text_query.strip().rstrip(".") + "."
-
+        """Run detection on a single image tile, offsetting boxes."""
         inputs = self._processor(images=image, text=query, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
@@ -67,18 +57,80 @@ class GroundingDINOLocalizer:
             inputs["input_ids"],
             box_threshold=box_threshold,
             text_threshold=text_threshold,
-            target_sizes=[image.size[::-1]],  # (height, width)
+            target_sizes=[image.size[::-1]],
         )[0]
 
-        h, w = frame_rgb.shape[:2]
-        detections = []
+        w_img, h_img = image.size
+        dets = []
         for box, score, label in zip(results["boxes"], results["scores"], results["labels"]):
             x1, y1, x2, y2 = box.cpu().tolist()
-            x1 = max(0, int(x1))
-            y1 = max(0, int(y1))
-            x2 = min(w, int(x2))
-            y2 = min(h, int(y2))
-            detections.append(([x1, y1, x2 - x1, y2 - y1], float(score), label))
+            x1 = max(0, int(x1)) + offset_x
+            y1 = max(0, int(y1)) + offset_y
+            x2 = min(w_img, int(x2)) + offset_x
+            y2 = min(h_img, int(y2)) + offset_y
+            dets.append(([x1, y1, x2 - x1, y2 - y1], float(score), label))
+        return dets
+
+    def detect(
+        self,
+        frame_rgb: np.ndarray,
+        text_query: str,
+        box_threshold: float = 0.30,
+        text_threshold: float = 0.25,
+        use_sahi: bool = False,
+        sahi_slice_size: int = 480,
+        sahi_overlap_ratio: float = 0.25,
+    ) -> List[Tuple[List[int], float, str]]:
+        """
+        Detect objects matching text_query in a frame.
+
+        Returns list of (bbox_xywh, confidence, label) sorted by confidence desc.
+        bbox_xywh is [x, y, w, h] in pixel coordinates.
+
+        When use_sahi=True, also runs detection on overlapping tiles to catch
+        small objects that are missed at full resolution (SAHI, arxiv 2202.06934).
+        """
+        self._load()
+        self._model.to(self.device)
+
+        image = Image.fromarray(frame_rgb)
+        query = text_query.strip().rstrip(".") + "."
+        h, w = frame_rgb.shape[:2]
+
+        # Full-frame detection (always)
+        detections = self._detect_single(image, query, box_threshold, text_threshold)
+
+        # Tiled detection for small objects
+        if use_sahi and (h > sahi_slice_size or w > sahi_slice_size):
+            stride = int(sahi_slice_size * (1 - sahi_overlap_ratio))
+            n_tiles = 0
+            n_tile_dets = 0
+            for y0 in range(0, h, stride):
+                for x0 in range(0, w, stride):
+                    x1 = min(x0 + sahi_slice_size, w)
+                    y1 = min(y0 + sahi_slice_size, h)
+                    if (x1 - x0) < sahi_slice_size // 2 or (y1 - y0) < sahi_slice_size // 2:
+                        continue
+                    tile = frame_rgb[y0:y1, x0:x1]
+                    tile_img = Image.fromarray(tile)
+                    tile_dets = self._detect_single(
+                        tile_img, query, box_threshold, text_threshold,
+                        offset_x=x0, offset_y=y0)
+                    detections.extend(tile_dets)
+                    n_tiles += 1
+                    n_tile_dets += len(tile_dets)
+
+            if n_tile_dets > 0:
+                # NMS across full-frame + tile detections
+                detections.sort(key=lambda d: d[1], reverse=True)
+                kept = []
+                for det in detections:
+                    if all(self._iou_xywh(det[0], k[0]) < 0.5 for k in kept):
+                        kept.append(det)
+                if len(kept) < len(detections):
+                    print(f"  [SAHI] {n_tiles} tiles -> {n_tile_dets} extra dets, "
+                          f"NMS merged {len(detections)} -> {len(kept)}")
+                detections = kept
 
         detections.sort(key=lambda d: d[1], reverse=True)
         return detections
@@ -106,6 +158,7 @@ class GroundingDINOLocalizer:
         max_area_frac: float = 0.25,
         top_k: int = 5,
         nms_iou: float = 0.5,
+        use_sahi: bool = False,
     ) -> List[Tuple[List[int], float, float, str]]:
         """
         Multi-instance detection: up to top_k detections per frame as
@@ -118,7 +171,8 @@ class GroundingDINOLocalizer:
         max_area_frac: reject detections larger than this fraction of the
         frame (prevents whole-counter / scene-level false positives).
         """
-        detections = self.detect(frame_rgb, text_query, box_threshold, text_threshold)
+        detections = self.detect(frame_rgb, text_query, box_threshold,
+                                 text_threshold, use_sahi=use_sahi)
         if not detections:
             return []
 
