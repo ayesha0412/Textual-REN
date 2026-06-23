@@ -8,9 +8,10 @@
     "s_gdino": 2.0,
     "s_ret": 0.0,
     "a_frac": -1.0,
-    "s_reid": 1.5
+    "s_reid": 1.5,
+    "s_vlm": 1.5
   },
   "bias": -3.5,
   "fitted": false,
-  "note": "hand-initialized defaults; fit on dev labels in Phase 4, then FROZEN"
+  "note": "hand-initialized defaults + s_vlm damped (YES=full, NO=0.3x)"
 }

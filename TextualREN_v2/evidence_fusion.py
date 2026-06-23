@@ -36,6 +36,13 @@ FEATURE_NAMES = [
     's_ret',     # retrieval peak as z-score of the video's similarity dist
     'a_frac',    # bbox area fraction of frame (soft version of size filter)
     's_reid',    # exemplar re-ID similarity (0.0 until Contribution A lands)
+    's_vlm',     # VLM verifier output in [-1, +1]: +1 = "YES this is the
+                 # target", -1 = "NO it isn't", 0 = "UNSURE / skipped".
+                 # Lazy-evaluated: only fired when m_conf < threshold (gate
+                 # alignment, ~30-40% of queries). Non-redundant with CLIP
+                 # because VLMs reason about object identity rather than
+                 # contrastive similarity. Intervention E in the calibration
+                 # plan; orthogonal to CERES (Liu et al. NeurIPS 2025).
 ]
 
 
@@ -50,6 +57,7 @@ class EvidenceVector:
     s_ret: float = 0.0
     a_frac: float = 0.0
     s_reid: float = 0.0
+    s_vlm: float = 0.0
 
     def to_dict(self) -> dict:
         return {k: round(float(v), 4) for k, v in asdict(self).items()}
@@ -74,11 +82,14 @@ class PresenceModel:
     # large (max of ~7000 samples), and flatter distributions of ABSENT
     # objects produce the most extreme z (observed: absent "zebra" z=5.2 vs
     # ubiquitous "pan" z=1.3). The dev fit decides its true sign and scale.
+    # s_vlm: +1.5 — VLM YES is full confidence, NO is damped to 0.3x
+    # in vlm_verifier.py (crop wrong != object absent). Weight lowered
+    # from 2.5 to 1.5 to prevent VLM from dominating fusion.
     _DEFAULT = {
         'weights': {
             's_clip': 8.0, 's_patch': 4.0, 'm_conf': 6.0, 'q_blur': 1.0,
             'c_app': 1.5, 's_gdino': 2.0, 's_ret': 0.0, 'a_frac': -1.0,
-            's_reid': 1.5,
+            's_reid': 1.5, 's_vlm': 1.5,
         },
         'bias': -3.5,
         'fitted': False,
@@ -106,12 +117,21 @@ class PresenceModel:
                          for name in FEATURE_NAMES)
         return 1.0 / (1.0 + math.exp(-z))
 
-    def fit(self, vectors: list, labels: list, save: bool = True) -> dict:
+    def fit(self, vectors: list, labels: list, save: bool = True,
+             C: float = 1.0, class_weight=None) -> dict:
         """
         Fit logistic weights on labeled evidence vectors (DEV SPLIT ONLY).
 
-        vectors: list[EvidenceVector] or list[list[float]]
-        labels:  list[int] (1 = correct/present, 0 = wrong/absent)
+        vectors:      list[EvidenceVector] or list[list[float]]
+        labels:       list[int] (1 = correct/present, 0 = wrong/absent)
+        C:            inverse regularization strength (lower = stronger).
+                      Default 1.0 (sklearn default). Use C<1 when N is
+                      small to prevent the fit collapsing to the prior.
+        class_weight: passed through to sklearn. Use 'balanced' when the
+                      positive:negative ratio exceeds ~3:1 so the loss
+                      cares about the minority class instead of just
+                      predicting the majority everywhere.
+
         Returns the fitted parameter dict; writes weights_path when save.
         """
         X = [v.to_list() if isinstance(v, EvidenceVector) else list(v)
@@ -120,7 +140,8 @@ class PresenceModel:
 
         try:
             from sklearn.linear_model import LogisticRegression
-            clf = LogisticRegression(max_iter=1000, C=1.0)
+            clf = LogisticRegression(max_iter=1000, C=C,
+                                       class_weight=class_weight)
             clf.fit(X, y)
             coefs = clf.coef_[0].tolist()
             bias = float(clf.intercept_[0])
