@@ -1,0 +1,218 @@
+# Text-VQL frozen query set v4 — EPIC-KITCHENS, 20 videos × ~5 queries.
+#
+# RULES:
+#  - Once frozen: never delete, never renumber, never edit text/video. Only
+#    `expected` and `notes` may be filled in after annotation. New queries go
+#    in a NEW file (query_set_v5.yaml), never appended here.
+#  - `expected` semantics: present | absent | unknown. `unknown` is the honest
+#    default for videos we haven't watched. Upgrade to present/absent ONLY
+#    after viewing debug_last_frame.jpg + the source video.
+#  - `split` is fixed at creation time. dev = used for fitting presence
+#    weights and tuning; test = held out, touched only for final paper numbers.
+#  - `tags` are descriptive (filter knobs), not labels. Multi-tag is fine.
+#
+# DESIGN — rigor knobs deliberately turned up vs v4-draft1:
+#  - ~70 distinct objects (was 18), spanning 8 kitchen categories so per-
+#    category breakdowns are honest.
+#  - 14 free-text descriptive queries (color, material, shape adjectives) so
+#    the LLM parser is actually exercised, not just `noun`.
+#  - Stress-test queries (wok, espresso machine, rice cooker on blind videos)
+#    — likely absent in many kitchens, so they double as abstention candidates.
+#  - Per-video shape: 1 common, 1 mid, 1 hard/uncommon, 1 free-text/descriptor,
+#    1 wildcard. Forces the system to be tested across difficulty bands per
+#    kitchen, not just averaged across them.
+#
+# CONFIRMED ANCHORS PRESERVED:
+#  - P02_01 q006–q010: kettle, knife, pan, sponge, tap (prior debugged runs)
+#  - P03_04 q011–q015: kettle, knife, pan, plate, tap (prior debugged runs)
+#  - P04_01 q016–q022: kettle, pan, knife, cutting board, thermos (absent),
+#                      chopsticks, rice cooker (heavily debugged + thermos
+#                      false-positive case from 2026-06-13)
+
+version: 4
+created: "2026-06-14"
+frozen: false                # set true once user approves; runner refuses edits then
+git_hash_at_freeze: null     # filled in at freeze time
+
+queries:
+  # ────────────────────────────────────────────────────────────────────
+  # P01_01 — universal (no prior runs). Mix common/mid/hard/descriptor.
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q001, video: P01_01, text: "knife",          expected: unknown, split: dev,  tags: [common, multi]}
+  - {id: q002, video: P01_01, text: "frying pan",     expected: unknown, split: dev,  tags: [common, single, free_text]}
+  - {id: q003, video: P01_01, text: "mug",            expected: unknown, split: dev,  tags: [common, single]}
+  - {id: q004, video: P01_01, text: "sink",           expected: unknown, split: dev,  tags: [common, single]}
+  - {id: q005, video: P01_01, text: "lid",            expected: unknown, split: test, tags: [hard, single]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P02_01 — confirmed anchors from prior runs.
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q006, video: P02_01, text: "kettle",         expected: present, split: dev,  tags: [common, single, anchor]}
+  - {id: q007, video: P02_01, text: "knife",          expected: present, split: dev,  tags: [common, multi, anchor]}
+  - {id: q008, video: P02_01, text: "pan",            expected: present, split: test, tags: [common, single, anchor]}
+  - {id: q009, video: P02_01, text: "sponge",         expected: present, split: dev,  tags: [common, single, anchor]}
+  - {id: q010, video: P02_01, text: "tap",            expected: present, split: dev,  tags: [common, single, anchor]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P03_04 — confirmed anchors.
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q011, video: P03_04, text: "kettle",         expected: present, split: dev,  tags: [common, single, anchor]}
+  - {id: q012, video: P03_04, text: "knife",          expected: present, split: dev,  tags: [common, multi, anchor]}
+  - {id: q013, video: P03_04, text: "pan",            expected: present, split: test, tags: [common, single, anchor]}
+  - {id: q014, video: P03_04, text: "plate",          expected: present, split: dev,  tags: [common, single, anchor]}
+  - {id: q015, video: P03_04, text: "tap",            expected: present, split: dev,  tags: [common, single, anchor]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P04_01 — heavily debugged. thermos is THE confirmed absent anchor.
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q016, video: P04_01, text: "kettle",         expected: present, split: dev,  tags: [common, single, anchor]}
+  - {id: q017, video: P04_01, text: "pan",            expected: present, split: dev,  tags: [common, multi, anchor]}
+  - {id: q018, video: P04_01, text: "knife",          expected: present, split: dev,  tags: [common, single, anchor]}
+  - {id: q019, video: P04_01, text: "cutting board",  expected: present, split: dev,  tags: [common, single, free_text, anchor]}
+  - {id: q020, video: P04_01, text: "thermos",        expected: absent,  split: test, tags: [uncommon, single, anchor]}
+  - {id: q021, video: P04_01, text: "chopsticks",     expected: present, split: test, tags: [uncommon, multi, anchor]}
+  - {id: q022, video: P04_01, text: "rice cooker",    expected: present, split: dev,  tags: [uncommon, single, free_text, anchor]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P05_01 — tableware / soft / appliance / utensil / descriptor
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q023, video: P05_01, text: "bowl",           expected: unknown, split: dev,  tags: [common, single]}
+  - {id: q024, video: P05_01, text: "towel",          expected: unknown, split: test, tags: [hard, single]}
+  - {id: q025, video: P05_01, text: "microwave",      expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q026, video: P05_01, text: "fork",           expected: unknown, split: dev,  tags: [common, multi]}
+  - {id: q027, video: P05_01, text: "wooden spoon",   expected: unknown, split: dev,  tags: [uncommon, single, free_text]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P06_01 — tableware / utensil / container / appliance / soft
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q028, video: P06_01, text: "plate",          expected: unknown, split: dev,  tags: [common, multi]}
+  - {id: q029, video: P06_01, text: "spoon",          expected: unknown, split: dev,  tags: [common, multi]}
+  - {id: q030, video: P06_01, text: "jar",            expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q031, video: P06_01, text: "oven",           expected: unknown, split: test, tags: [uncommon, single]}
+  - {id: q032, video: P06_01, text: "sponge",         expected: unknown, split: dev,  tags: [common, single]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P07_01 — hard utensil / free-text cookware / container / fixture / utensil
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q033, video: P07_01, text: "whisk",          expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q034, video: P07_01, text: "stainless steel pot", expected: unknown, split: dev, tags: [uncommon, single, free_text]}
+  - {id: q035, video: P07_01, text: "bottle",         expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q036, video: P07_01, text: "hob",            expected: unknown, split: test, tags: [hard, single]}
+  - {id: q037, video: P07_01, text: "fork",           expected: unknown, split: dev,  tags: [common, multi]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P08_01 — hard utensil / free-text / tableware / fixture / consumable
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q038, video: P08_01, text: "tongs",          expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q039, video: P08_01, text: "wooden cutting board", expected: unknown, split: dev, tags: [uncommon, single, free_text]}
+  - {id: q040, video: P08_01, text: "glass",          expected: unknown, split: test, tags: [common, single, hard]}
+  - {id: q041, video: P08_01, text: "drawer",         expected: unknown, split: dev,  tags: [hard, single]}
+  - {id: q042, video: P08_01, text: "butter",         expected: unknown, split: dev,  tags: [uncommon, single]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P09_01 — hard utensil / 2 free-text / hard utensil / consumable
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q043, video: P09_01, text: "peeler",         expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q044, video: P09_01, text: "metal kettle",   expected: unknown, split: dev,  tags: [common, single, free_text]}
+  - {id: q045, video: P09_01, text: "blue cup",       expected: unknown, split: dev,  tags: [common, single, free_text]}
+  - {id: q046, video: P09_01, text: "grater",         expected: unknown, split: test, tags: [uncommon, single, hard]}
+  - {id: q047, video: P09_01, text: "onion",          expected: unknown, split: dev,  tags: [uncommon, single]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P10_01 — hard utensil / container / container / appliance / utensil
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q048, video: P10_01, text: "ladle",          expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q049, video: P10_01, text: "jug",            expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q050, video: P10_01, text: "can",            expected: unknown, split: test, tags: [uncommon, single, hard]}
+  - {id: q051, video: P10_01, text: "microwave",      expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q052, video: P10_01, text: "spatula",        expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P11_01 — stress test (wok often absent) / container / appliance / free-text / consumable
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q053, video: P11_01, text: "wok",            expected: unknown, split: test, tags: [uncommon, single]}
+  - {id: q054, video: P11_01, text: "packet",         expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q055, video: P11_01, text: "dishwasher",     expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q056, video: P11_01, text: "ceramic bowl",   expected: unknown, split: dev,  tags: [common, single, free_text]}
+  - {id: q057, video: P11_01, text: "egg",            expected: unknown, split: dev,  tags: [uncommon, multi, hard]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P12_01 — container / free-text / consumable / free-text / small
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q058, video: P12_01, text: "tin",            expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q059, video: P12_01, text: "white plate",    expected: unknown, split: dev,  tags: [common, multi, free_text]}
+  - {id: q060, video: P12_01, text: "garlic",         expected: unknown, split: test, tags: [uncommon, single, hard]}
+  - {id: q061, video: P12_01, text: "glass jar",      expected: unknown, split: dev,  tags: [uncommon, single, free_text]}
+  - {id: q062, video: P12_01, text: "lighter",        expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P13_01 — free-text / cookware variant / free-text / appliance / soft
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q063, video: P13_01, text: "salt shaker",    expected: unknown, split: test, tags: [uncommon, single, free_text, hard]}
+  - {id: q064, video: P13_01, text: "saucepan",       expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q065, video: P13_01, text: "silver knife",   expected: unknown, split: dev,  tags: [common, multi, free_text]}
+  - {id: q066, video: P13_01, text: "toaster",        expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q067, video: P13_01, text: "paper towel",    expected: unknown, split: dev,  tags: [uncommon, single, free_text, hard]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P14_01 — soft / free-text / appliance / fixture / consumable
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q068, video: P14_01, text: "mitt",           expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q069, video: P14_01, text: "plastic bottle", expected: unknown, split: dev,  tags: [uncommon, single, free_text]}
+  - {id: q070, video: P14_01, text: "scale",          expected: unknown, split: test, tags: [uncommon, single]}
+  - {id: q071, video: P14_01, text: "cabinet",        expected: unknown, split: dev,  tags: [hard, single]}
+  - {id: q072, video: P14_01, text: "bread",          expected: unknown, split: dev,  tags: [uncommon, single]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P15_01 — hard utensil / free-text / appliance / soft / consumable
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q073, video: P15_01, text: "grater",         expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q074, video: P15_01, text: "yellow sponge",  expected: unknown, split: dev,  tags: [common, single, free_text]}
+  - {id: q075, video: P15_01, text: "blender",        expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q076, video: P15_01, text: "apron",          expected: unknown, split: test, tags: [uncommon, single, hard]}
+  - {id: q077, video: P15_01, text: "oil",            expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P16_01 — soft / tableware / soft / hard utensil / small
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q078, video: P16_01, text: "cloth",          expected: unknown, split: dev,  tags: [hard, single]}
+  - {id: q079, video: P16_01, text: "saucer",         expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q080, video: P16_01, text: "bag",            expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q081, video: P16_01, text: "peeler",         expected: unknown, split: test, tags: [uncommon, single, hard]}
+  - {id: q082, video: P16_01, text: "knob",           expected: unknown, split: dev,  tags: [hard, multi]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P17_01 — free-text / fixture / consumable / appliance / fixture
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q083, video: P17_01, text: "wok pan",        expected: unknown, split: dev,  tags: [uncommon, single, free_text]}
+  - {id: q084, video: P17_01, text: "counter",        expected: unknown, split: test, tags: [hard, single]}
+  - {id: q085, video: P17_01, text: "salt",           expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q086, video: P17_01, text: "fridge",         expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q087, video: P17_01, text: "shelf",          expected: unknown, split: dev,  tags: [hard, single]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P18_01 — soft / free-text / appliance / utensil / small
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q088, video: P18_01, text: "apron",          expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q089, video: P18_01, text: "red bowl",       expected: unknown, split: test, tags: [common, single, free_text]}
+  - {id: q090, video: P18_01, text: "scale",          expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q091, video: P18_01, text: "chopsticks",     expected: unknown, split: dev,  tags: [uncommon, multi]}
+  - {id: q092, video: P18_01, text: "handle",         expected: unknown, split: dev,  tags: [hard, multi]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P19_01 — appliance / hard utensil / soft / common / small
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q093, video: P19_01, text: "rice cooker",    expected: unknown, split: dev,  tags: [uncommon, single, free_text]}
+  - {id: q094, video: P19_01, text: "spatula",        expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q095, video: P19_01, text: "towel",          expected: unknown, split: test, tags: [hard, single]}
+  - {id: q096, video: P19_01, text: "knife",          expected: unknown, split: dev,  tags: [common, multi]}
+  - {id: q097, video: P19_01, text: "match",          expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+
+  # ────────────────────────────────────────────────────────────────────
+  # P20_01 — appliance / appliance / small / common / container
+  # ────────────────────────────────────────────────────────────────────
+  - {id: q098, video: P20_01, text: "blender",        expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q099, video: P20_01, text: "oven",           expected: unknown, split: dev,  tags: [uncommon, single]}
+  - {id: q100, video: P20_01, text: "lighter",        expected: unknown, split: dev,  tags: [uncommon, single, hard]}
+  - {id: q101, video: P20_01, text: "kettle",         expected: unknown, split: dev,  tags: [common, single]}
+  - {id: q102, video: P20_01, text: "box",            expected: unknown, split: test, tags: [uncommon, single, hard]}
