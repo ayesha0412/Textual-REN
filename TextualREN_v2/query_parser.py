@@ -713,6 +713,82 @@ Return ONLY valid JSON."""
             source='llm',
         )
 
+    # ------------------------------------------------------------------ #
+    # Verifier-guided plan refinement (test-time scaling)                   #
+    # ------------------------------------------------------------------ #
+
+    _REFINE_SYSTEM_PROMPT = """You revise a detection plan that FAILED for a visual localization system.
+You receive the original plan and verifier feedback describing what went wrong
+(e.g., a look-alike object scored nearly as high as the target).
+
+Return improved JSON with the SAME 5 fields:
+- "target": a MORE VISUALLY SPECIFIC description of the SAME physical object — add discriminative attributes (distinctive parts, shape, material). Never change which object is meant.
+- "detection_prompt": exactly 3 NEW visually discriminative phrases, period-separated. Do NOT reuse phrases listed as already tried.
+- "confusables": KEEP all previous confusables and ADD the look-alike named in the feedback plus any similar objects you expect in the same scene.
+- "retrieval_prompts": 3 short visual descriptions starting with "a" or "the"
+- "context_hint": one sentence
+Return ONLY valid JSON."""
+
+    def refine_plan(self, plan: QueryPlan, feedback: dict) -> Optional[QueryPlan]:
+        """
+        LLM revises a plan using structured verifier feedback. Cached by
+        (query, feedback) hash so refinements are reproducible.
+        """
+        fb_str = json.dumps(feedback, sort_keys=True)
+        cache_key = hashlib.md5(
+            (plan.original_query.lower().strip() + '|refine|' + fb_str).encode()
+        ).hexdigest()
+        cache_path = os.path.join(self.cache_dir, f"refine_{cache_key}.json")
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r') as f:
+                    refined = self._plan_from_dict(plan.original_query, json.load(f))
+                refined.source = 'llm_refined'
+                return refined
+            except (json.JSONDecodeError, KeyError):
+                pass
+
+        user_msg = (
+            f'Query: "{plan.original_query}"\n'
+            f'Previous plan: {json.dumps({"target": plan.target, "detection_prompt": plan.detection_prompt, "confusables": plan.confusables})}\n'
+            f'Verifier feedback: {json.dumps(feedback)}\n'
+            f'Return ONLY a JSON object.'
+        )
+
+        raw = None
+        if self.llm_backend == "transformers":
+            raw = self._call_transformers_chat(self._REFINE_SYSTEM_PROMPT, user_msg)
+        elif self.llm_backend == "ollama":
+            raw = self._call_ollama(self._REFINE_SYSTEM_PROMPT + "\n\n" + user_msg)
+        if raw is None:
+            return None
+        data = self._extract_json(raw)
+        if data is None:
+            print("  [QueryParser] Could not parse refined plan JSON")
+            return None
+
+        # Negatives are cumulative across iterations: union old + new
+        old_conf = list(plan.confusables)
+        new_conf = data.get('confusables', [])
+        if isinstance(new_conf, list):
+            seen_l = {c.lower() for c in old_conf}
+            data['confusables'] = old_conf + [
+                c for c in new_conf
+                if isinstance(c, str) and c.strip() and c.lower() not in seen_l
+            ]
+
+        data['query'] = plan.original_query
+        data['source'] = 'llm_refined'
+        data['model'] = self.llm_model
+        data['timestamp'] = time.strftime('%Y-%m-%dT%H:%M:%S')
+        os.makedirs(self.cache_dir, exist_ok=True)
+        with open(cache_path, 'w') as f:
+            json.dump(data, f, indent=2)
+
+        refined = self._plan_from_dict(plan.original_query, data)
+        refined.source = 'llm_refined'
+        return refined
+
     @staticmethod
     def _extract_json(text: str) -> Optional[dict]:
         """Extract JSON object from LLM response (handles markdown fences)."""
@@ -892,6 +968,15 @@ Return ONLY valid JSON."""
           - Qwen/Qwen3-1.7B   (~3.4GB VRAM, better quality but heavier)
           - microsoft/Phi-4-mini-instruct  (~7.6GB VRAM, best reasoning)
         """
+        user_msg = (
+            f'Query: "{prompt.split("Query:")[1].split(chr(10))[0].strip().strip(chr(34))}"'
+            if 'Query:' in prompt else f'Query: "{prompt}"'
+        )
+        return self._call_transformers_chat(self._LLM_SYSTEM_PROMPT, user_msg)
+
+    def _call_transformers_chat(self, system_prompt: str,
+                                 user_msg: str) -> Optional[str]:
+        """Generic chat call — used by initial parsing AND plan refinement."""
         try:
             import torch
         except ImportError:
@@ -901,14 +986,11 @@ Return ONLY valid JSON."""
         try:
             self._load_hf_model()
 
-            # Build chat messages
             messages = [
-                {"role": "system", "content": self._LLM_SYSTEM_PROMPT},
-                {"role": "user", "content": f'Query: "{prompt.split("Query:")[1].split(chr(10))[0].strip().strip(chr(34))}"'
-                 if 'Query:' in prompt else f'Query: "{prompt}"'},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
             ]
 
-            # Apply chat template
             # Qwen3 supports enable_thinking=False for fast JSON;
             # Qwen2.5 and others don't have this param — use try/except
             try:
@@ -916,7 +998,7 @@ Return ONLY valid JSON."""
                     messages,
                     tokenize=False,
                     add_generation_prompt=True,
-                    enable_thinking=False,  # Qwen3: skip thinking for fast JSON
+                    enable_thinking=False,
                 )
             except TypeError:
                 text = self._hf_tokenizer.apply_chat_template(
