@@ -2,6 +2,14 @@ data:
   sam2_ckpt: '../checkpoints/sam2.1_hiera_large.pt'
 
 text_query:
+  # Encoder backend for retrieval + verification. Different encoders produce
+  # different patch shapes/embeddings, so they MUST live in separate index
+  # directories (enforced by run_id config-hash). Changing this field
+  # invalidates the existing indexes.
+  encoder: clip                # "clip" (OpenCLIP ViT-g-14, default) | "siglip2"
+  siglip_model: 'google/siglip2-large-patch16-256'  # used when encoder=siglip2;
+                               # 16×16 patch grid + 1024 dim matches CLIP layout
+                               # → minimal re-rank surgery for the comparison
   similarity_threshold: 0.18   # CLIP cosine similarity cutoff for candidate frames
   context_seconds: 6.0          # ±3 seconds temporal window for Stage 4
   frame_sample_rate: 10         # process every Nth frame for CLIP retrieval (1 = all)

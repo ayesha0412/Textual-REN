@@ -107,10 +107,11 @@ class VideoIndexer:
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
         n_sampled = max(1, total_frames // sample_rate)
+        enc_label = self.localizer.encoder_name.upper()
         print(f"  Source  : {total_frames} frames @ {fps:.2f} fps  "
               f"({frame_width}x{frame_height})")
         print(f"  Sampling: every {sample_rate}th frame -> ~{n_sampled} frames")
-        print(f"  CLIP batch size : {self.CLIP_BATCH_SIZE}")
+        print(f"  Encoder : {enc_label}  (batch size {self.CLIP_BATCH_SIZE})")
 
         clip_embeddings   = []
         patch_embeddings  = []
@@ -245,7 +246,7 @@ class VideoIndexer:
         print(f"Index saved to: {output_dir}")
         print(f"  - FAISS index: {index_path}")
         print(f"  - Metadata: {metadata_path}")
-        print(f"  - CLIP embeddings: {embeddings_path}")
+        print(f"  - {enc_label} embeddings: {embeddings_path}")
         if do_patches and patch_embeddings:
             print(f"  - Patch embeddings: {patch_emb_path}")
         if blur_scores:
@@ -278,8 +279,12 @@ class VideoIndexer:
 
     def _extract_patch_tokens_batch(self, frames: List[np.ndarray]) -> np.ndarray:
         """
-        Extract CLIP patch tokens for a batch of BGR frames.
-        Each frame produces 256 patch tokens of dim 1024 (projected to joint space).
+        Extract patch tokens for a batch of BGR frames.
+        Dispatches to the active encoder via localizer.encode_patches —
+        CLIP path produces (B, 256, 1024) joint-space patches; SigLIP 2
+        path produces (B, N_patches, D) vision hidden tokens. The shape
+        flows through unchanged; the index dir is keyed by config hash so
+        different encoders never share a dir.
         """
         imgs = torch.stack([
             self.localizer.clip_preprocess(
@@ -287,19 +292,7 @@ class VideoIndexer:
             )
             for f in frames
         ]).to(self.device)
-
-        visual = self.localizer.clip_model.visual
-
-        with torch.no_grad(), torch.autocast(
-            self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
-        ):
-            out = visual.forward_intermediates(
-                imgs, indices=[-1], intermediates_only=False, output_fmt='NLC'
-            )
-            patches = out['image_intermediates'][-1].float()  # (B, 256, 1408)
-            patches = visual.ln_post(patches) @ visual.proj.float()  # (B, 256, 1024)
-
-        patches = torch.nn.functional.normalize(patches, p=2, dim=-1)
+        patches = self.localizer.encode_patches(imgs)
         return patches.float().cpu().numpy()
 
 

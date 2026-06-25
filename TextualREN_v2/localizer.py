@@ -23,7 +23,68 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
-import open_clip
+import open_clip  # OpenCLIP backend (default encoder)
+
+# ─── SigLIP 2 backend: HF transformers wrappers ──────────────────────────
+# Loaded lazily inside the SigLIP 2 path so the CLIP-only path doesn't
+# import transformers at all (avoids version drag in legacy environments).
+
+class _SigLIPModelAdapter(torch.nn.Module):
+    """
+    Wraps a HF SigLIP/SigLIP2 model to expose the OpenCLIP-shaped API the
+    rest of the pipeline expects: encode_text(tokens) and encode_image(imgs)
+    returning (B, D) un-normalised tensors. Internal layers retain HF's
+    structure so we can read patch tokens directly for the re-rank path.
+    """
+    def __init__(self, hf_model):
+        super().__init__()
+        self.hf_model = hf_model
+        # vision_model and text_model are HF SigLIP submodules.
+        self.visual = hf_model.vision_model       # used by patch extractor
+        self.text   = hf_model.text_model
+
+    def encode_text(self, tokens):
+        # tokens is a dict from the wrapped tokenizer.
+        out = self.hf_model.get_text_features(**{k: v for k, v in tokens.items()
+                                                  if k in ('input_ids', 'attention_mask')})
+        return out  # (B, D)
+
+    def encode_image(self, imgs):
+        out = self.hf_model.get_image_features(pixel_values=imgs)
+        return out  # (B, D)
+
+    def eval(self):
+        self.hf_model.eval()
+        return self
+
+
+class _SigLIPTokenizerAdapter:
+    """Callable wrapper around HF's SigLIP processor.tokenizer so call sites
+    can do `tokens = tokenizer([texts])` like OpenCLIP. Returns a dict that
+    _SigLIPModelAdapter.encode_text knows how to consume."""
+    def __init__(self, hf_processor, device):
+        self.processor = hf_processor
+        self.device = device
+
+    def __call__(self, texts):
+        if isinstance(texts, str):
+            texts = [texts]
+        # SigLIP 2 wants max_length padding to 64 tokens by default
+        out = self.processor(text=texts, padding='max_length',
+                              max_length=64, truncation=True, return_tensors='pt')
+        return {k: v.to(self.device) for k, v in out.items()}
+
+
+class _SigLIPPreprocessAdapter:
+    """Wraps HF's SigLIP image processor as a callable PIL.Image -> Tensor
+    that matches OpenCLIP's preprocess signature (single image, no batch)."""
+    def __init__(self, hf_processor):
+        self.processor = hf_processor
+
+    def __call__(self, pil_image):
+        # processor returns dict with pixel_values shape (1, 3, H, W); strip batch
+        out = self.processor(images=pil_image, return_tensors='pt')
+        return out['pixel_values'][0]
 
 # Resolve sibling paths regardless of working directory
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -53,12 +114,40 @@ class TextQueryLocalizer:
         self.tracker_param = config['text_query']['tracker_param']
         self.patch_size   = config['text_query']['patch_size']
 
-        print('[TextQueryLocalizer] Loading OpenCLIP ViT-g-14 (laion2b)…')
-        self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
-            'ViT-g-14', pretrained='laion2b_s34b_b88k', device=device
-        )
-        self.clip_model.eval()
-        self.tokenizer = open_clip.get_tokenizer('ViT-g-14')
+        # Encoder dispatch — default CLIP keeps every existing index/result
+        # bit-identical. SigLIP 2 is opt-in via config['text_query']['encoder'].
+        # The two paths produce different patch shapes/embeddings, so they
+        # MUST land in different index dirs (enforced by run_id config-hash).
+        self.encoder_name = config['text_query'].get('encoder', 'clip')
+
+        if self.encoder_name == 'clip':
+            print('[TextQueryLocalizer] Loading OpenCLIP ViT-g-14 (laion2b)…')
+            self.clip_model, _, self.clip_preprocess = open_clip.create_model_and_transforms(
+                'ViT-g-14', pretrained='laion2b_s34b_b88k', device=device
+            )
+            self.clip_model.eval()
+            self.tokenizer = open_clip.get_tokenizer('ViT-g-14')
+            self.embedding_dim = 1024
+            self.patch_grid    = 16   # ViT-g-14 = 16×16 patches at 224 input
+
+        elif self.encoder_name == 'siglip2':
+            from transformers import AutoModel, AutoProcessor
+            model_id = config['text_query'].get('siglip_model',
+                                                'google/siglip2-large-patch16-256')
+            print(f'[TextQueryLocalizer] Loading SigLIP 2 ({model_id})…')
+            hf_model = AutoModel.from_pretrained(model_id).to(device)
+            hf_proc  = AutoProcessor.from_pretrained(model_id)
+            self.clip_model      = _SigLIPModelAdapter(hf_model).to(device)
+            self.clip_model.eval()
+            self.clip_preprocess = _SigLIPPreprocessAdapter(hf_proc)
+            self.tokenizer       = _SigLIPTokenizerAdapter(hf_proc, device)
+            # siglip2-large-patch16-256 → 16×16 = 256 patches, dim 1024
+            self.embedding_dim = hf_model.config.text_config.hidden_size
+            self.patch_grid    = hf_model.config.vision_config.image_size // \
+                                 hf_model.config.vision_config.patch_size
+        else:
+            raise ValueError(f"Unknown encoder: {self.encoder_name!r} "
+                             f"(expected 'clip' or 'siglip2')")
 
         # REN loaded lazily on first use — indexing never needs it,
         # so this keeps ~3–4 GB VRAM free during prepare_index.py.
@@ -76,13 +165,65 @@ class TextQueryLocalizer:
     # ------------------------------------------------------------------ #
 
     def encode_text(self, query: str) -> torch.Tensor:
-        """Returns L2-normalised CLIP text embedding, shape (1, D)."""
-        tokens = self.tokenizer([query]).to(self.device)
+        """Returns L2-normalised text embedding, shape (1, D)."""
+        tokens = self.tokenizer([query])
+        # OpenCLIP tokenizer returns Tensor; SigLIP wrapper returns a
+        # device-resident dict. Normalise the device step here.
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.to(self.device)
         with torch.no_grad(), torch.autocast(
             self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
         ):
             feat = self.clip_model.encode_text(tokens).float()
         return F.normalize(feat, p=2, dim=-1)
+
+    def encode_text_batch(self, queries) -> torch.Tensor:
+        """Batched, L2-normalised text embeddings, shape (B, D).
+        Use this instead of `open_clip.tokenize(...) → encode_text(...)` at
+        every call site — it dispatches to the active encoder cleanly."""
+        if isinstance(queries, str):
+            queries = [queries]
+        tokens = self.tokenizer(list(queries))
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.to(self.device)
+        with torch.no_grad(), torch.autocast(
+            self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
+        ):
+            feats = self.clip_model.encode_text(tokens).float()
+        return F.normalize(feats, p=2, dim=-1)
+
+    def encode_patches(self, imgs: torch.Tensor) -> torch.Tensor:
+        """L2-normalised patch tokens, shape (B, N_patches, D).
+        For CLIP: uses OpenCLIP's forward_intermediates + ln_post + proj
+        path — same patches the existing indexes store.
+        For SigLIP 2: takes vision_model.last_hidden_state (already
+        post_layernormed by the SigLIP forward) and applies the vision
+        head's MLP+residual per patch — the same projection the pooled
+        joint-space feature goes through, skipping only the attention
+        pooling step (which would collapse N patches to 1). Result:
+        per-patch features in a space closely aligned with the text
+        features that come from get_text_features."""
+        with torch.no_grad(), torch.autocast(
+            self.device.type, dtype=torch.bfloat16, enabled=self.device.type == 'cuda'
+        ):
+            if self.encoder_name == 'clip':
+                visual = self.clip_model.visual
+                out = visual.forward_intermediates(
+                    imgs, indices=[-1], intermediates_only=False, output_fmt='NLC'
+                )
+                patches = out['image_intermediates'][-1].float()
+                patches = visual.ln_post(patches) @ visual.proj.float()
+            else:  # siglip2
+                outputs = self.clip_model.visual(
+                    pixel_values=imgs, output_hidden_states=False
+                )
+                patches = outputs.last_hidden_state.float()    # (B, N, D)
+                head = self.clip_model.hf_model.vision_model.head
+                if head is not None and hasattr(head, 'mlp') \
+                                   and hasattr(head, 'layernorm'):
+                    # Per-patch analog of the pooled joint-space projection.
+                    patches = patches + head.mlp(head.layernorm(patches))
+        return F.normalize(patches, p=2, dim=-1)
 
     def encode_frames_clip(self, frames: list, batch_size: int = 32) -> torch.Tensor:
         """Returns stacked L2-normalised CLIP image embeddings, shape (N, D)."""
