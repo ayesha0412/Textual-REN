@@ -1,0 +1,204 @@
+data:
+  sam2_ckpt: '../checkpoints/sam2.1_hiera_large.pt'
+
+text_query:
+  # Encoder backend for retrieval + verification. Different encoders produce
+  # different patch shapes/embeddings, so they MUST live in separate index
+  # directories (enforced by run_id config-hash). Changing this field
+  # invalidates the existing indexes.
+  encoder: siglip2                # "clip" (OpenCLIP ViT-g-14, default) | "siglip2"
+  siglip_model: 'google/siglip2-large-patch16-256'  # used when encoder=siglip2;
+                               # 16×16 patch grid + 1024 dim matches CLIP layout
+                               # → minimal re-rank surgery for the comparison
+  # SigLIP 2's contrastive similarity distribution sits systematically lower
+  # than CLIP's (sigmoid loss vs softmax; different normalization regime).
+  # Empirical range on q006 kettle: CLIP s_clip≈0.23, SigLIP s_clip≈0.13.
+  # All the thresholds below are recalibrated for SigLIP's distribution —
+  # NEVER copy these into the CLIP config without re-fitting.
+  similarity_threshold: 0.08    # was 0.18 (CLIP); SigLIP scores are ~55% as large
+  adaptive_min_tau: 0.03        # lower floor — was 0.10 (CLIP); below this
+                                # SigLIP retrieval saw "no frames above
+                                # threshold 0.1" RuntimeError on q003/q008
+  adaptive_max_tau: 0.25        # was 0.30 (CLIP)
+  context_seconds: 6.0
+  frame_sample_rate: 10
+  min_crop_verify: 0.08         # was 0.17 (CLIP); same encoder-shift reasoning
+  neg_weight: 0.25              # weight for negative prompts (0 = disabled)
+  confusable_margin_delta: 0.03 # confusable must WIN by this margin to reject
+                                # (CLIP sims closer than ~0.03 are noise)
+  min_clean_margin: 0.02        # target must WIN by this margin for a candidate
+                                # to be eligible as the response (tie-band passers
+                                # remain fallback only); interim until fitted weights
+  universal_negatives: true     # margins also computed against COCO-80 names —
+                                # keeps margins honest when the LLM's own
+                                # negatives are nonsense (domain-general)
+
+  # Evidence fusion (Contribution C): all verification signals fuse into one
+  # presence posterior p = sigma(w·f + b); weights fit ONCE on dev, frozen
+  presence_weights: 'configs/presence_weights.json'
+  tau_accept: 0.40              # p >= accept -> confident FOUND (lowered from 0.50
+                                # after calibration on 99 human-labeled results:
+                                # 90% precision maintained, recall 26%->42%)
+  tau_refine: 0.50              # p < refine -> refinement fires (decoupled from
+                                # tau_accept: lowering accept without this caused
+                                # regressions — q007 knife skipped refinement at
+                                # p=0.42, got stuck with wrong detection)
+  tau_abstain: 0.15             # p < abstain -> NOT FOUND (calibrated abstention)
+                                # between tau_abstain and tau_accept -> final decision zone
+                                # between tau_accept and tau_refine -> refinement zone
+
+  # Plan refinement (Contribution B): when the preliminary presence lands in
+  # the uncertainty zone, verifier feedback (near-tie look-alike, margin,
+  # tried prompts) goes back to the LLM, which revises the plan; recent
+  # passing candidates are re-verified under it. Test-time scaling, capped.
+  plan_refinement: true
+  max_refine_iters: 2
+
+  # Intervention E — VLM verifier (Qwen2.5-VL-3B by default).
+  # Adds s_vlm as the 10th evidence feature. Fires only when the encoder's
+  # confusable margin is thin (m_conf < vlm_min_margin_for_skip), so ~60-70%
+  # of queries skip it. ~3-5 sec per call when fired; ~6 GB VRAM when loaded.
+  # Loads once per process. Disable for clean training-free-without-VLM
+  # ablations.
+  use_vlm_verifier: true
+  vlm_model: 'Qwen/Qwen2.5-VL-3B-Instruct'
+  vlm_min_margin_for_skip: 0.05  # skip VLM when m_conf >= this (reverted to 0.05:
+                                # raising to 0.10 caused regressions — VLM fired
+                                # on correct detections and damaged their scores)
+  vlm_top_k: 3                   # verify top-K crops (not just top-1) for rescue
+
+  # SAHI tiled detection — overlapping tiles catch small objects (chopsticks,
+  # lighter, fork) that are missed at full resolution.
+  use_sahi: true
+
+  # Exemplar re-ID (Contribution A): the verified detection bootstraps an
+  # instance-level exemplar bank (DINOv2) that sweeps the index for every
+  # other occurrence of the SAME object
+  exemplar_reid: true
+  exemplar_views: 8             # views harvested from detection + SAM2 track
+  exemplar_top_k: 12            # candidate index rows to verify per sweep
+  reid_sim_threshold: 0.6       # min DINOv2 similarity vs exemplar bank
+  max_reid_occurrences: 5       # cap on re-ID occurrences per query
+  # If the final segment is weak, fall back to the strongest segment instead.
+  last_segment_min_peak: 0.18   # absolute min peak to trust the last segment (= threshold)
+  last_segment_min_rel: 0.60    # or relative to global peak (last >= rel * global)
+  tracker_name: 'sam2'
+  tracker_param: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+  patch_size: 8                 # feature patch size for SAM-pooled tokens (DINO)
+  save_dir: 'logs/'
+
+  # RELOCATE Stage 3: Selection Policy
+  selection_policy: "last"      # "last", "strongest", "topk", "topp"
+  verified_selection: "best"    # among verification-PASSING candidates:
+                                # "latest" = most recent (episodic/VQ2D semantics)
+                                # "best"   = highest combined score
+                                # INTERIM "best": "latest" requires per-candidate
+                                # calibrated acceptance (fitted weights / refinement
+                                # loop) — near-tie look-alikes currently win recency
+  selection_top_k: 10           # For topk/topp mode
+  selection_top_p: 0.9          # Nucleus sampling threshold
+  nms_threshold: 0.5            # Inter-frame NMS: suppress within 0.5s
+  nms_window: null              # Or: group frames in windows (null = threshold-based NMS)
+
+  # RELOCATE Stage 5: Multi-Candidate Refinement
+  max_candidates_to_refine: 5   # Beam search width for refinement
+
+  # SAM2 settings
+  sam_inference_size: 512       # 1024 = full quality, 768/512 = faster with similar masks
+  skip_sam2_eval: false         # SAM2 tracks object across context window
+  cache_sam_results: true
+
+  # Multi-instance: detect ALL matching objects on the response frame,
+  # one SAM2 track per instance (primary instance renders the result clip)
+  multi_instance: true
+  max_instances: 5
+  save_masks: true              # encode SAM2 masks as COCO RLE in --json-out exports
+                                # (EgoMask metrics are mask-level)
+
+  # Spatial localization method for Stage 5 (bbox detection)
+  # "grounding_dino" — text-conditioned detection, training-free (recommended)
+  # "ren_clip"        — REN grid proposals + CLIP crop scoring (legacy)
+  spatial_method: "grounding_dino"
+
+  # Adaptive threshold: compute τ per-query from similarity distribution
+  adaptive_threshold: true
+  threshold_alpha: 1.0            # τ = μ + α·σ, clamped to [0.10, 0.30]
+
+  # Blur-aware frame quality gating (Laplacian variance)
+  # Frames below this threshold are penalized in candidate scoring
+  blur_threshold: 50.0            # < 50 = severe motion blur
+
+  # Query parser: "rule_based" (fast, no deps) or "llm" (local open-source model)
+  query_parser: "llm"
+  use_ontology: true              # ontology = warm cache of pre-verified plans;
+                                  # false = every query goes through the LLM (ablation)
+  # LLM settings (only used when query_parser: "llm")
+  llm_backend: "transformers"      # "transformers" (recommended) or "ollama"
+  llm_model: "Qwen/Qwen3-0.6B"   # transformers: Qwen/Qwen3-0.6B (0.6B, ~1.2GB VRAM)
+                                  #   alt: Qwen/Qwen3-1.7B (~3.4GB), microsoft/Phi-4-mini-instruct (~7.6GB)
+                                  # ollama: phi3:mini, llama3.2:3b, mistral:7b
+
+  # FAISS indexing parameters
+  faiss:
+    clip_dim: 1024                # SigLIP-2-large output dim (same as ViT-g-14)
+    top_k: 100
+    index_type: 'flat'
+    # SigLIP 2's per-patch tokens come from its vision encoder's
+    # last_hidden_state, which is NOT directly aligned with the text
+    # feature space (the model only trains the attention-pooled CLS to
+    # match text). My head.mlp(head.layernorm(patches)) projection is a
+    # partial heuristic — sufficient to make patches non-random but not
+    # strong enough that mixing them at 0.6 weight (as the rerank does)
+    # helps retrieval. Disabling patch rerank for SigLIP gives the
+    # cleanest, most honest comparison: SigLIP's CLS-only retrieval vs
+    # CLIP's CLS + patch rerank. If we later add proper sliding-window
+    # joint-space patches for SigLIP, this can be re-enabled.
+    use_patch_rerank: false
+    patch_top_k: 100
+
+# Grounding DINO — text-conditioned open-vocabulary object detection
+grounding_dino:
+  model_id: 'IDEA-Research/grounding-dino-base'  # tiny -> base: ~2x capacity,
+                                                 # same API; single-variable swap
+  box_threshold: 0.20
+  text_threshold: 0.20
+
+ren:
+  pretrained:
+    feature_extractors:
+      - 'dinov2_vitl14'
+    patch_sizes:
+      - 14
+    region_extractor: 'sam2_hierra'
+    sam2_hieral_ckpt: '../checkpoints/sam2.1_hiera_large.pt'
+    sam2_hieral_config: 'configs/sam2.1/sam2.1_hiera_l.yaml'
+
+  architecture:
+    grid_size: 32
+    hidden_dim: 1024
+    decoder_layers: 4
+    num_attention_heads: 8
+
+  parameters:
+    image_resolution: 518
+    batch_size: 16
+    learning_rate: 0.001
+    num_epochs: 50
+    max_prompts: 256
+    accumulation_steps: 1
+    warmup_steps: 100
+    logging_steps: 25
+    max_grad_norm: 5.0
+    upsample_features: False
+    deduplicate_masks: False
+    num_workers: 16
+    feature_extractor: 'dinov2_vitl14'
+    grid_size: 32
+    use_slic: False
+    aggregate_tokens: False
+    token_variant: 'default'
+    ren_ckpt: './logs/ren-dinov2-vitl14/checkpoint.pth'
+
+  logging:
+    save_dir: '../logs/'
+    exp_name: 'ren-dinov2-vitl14'
