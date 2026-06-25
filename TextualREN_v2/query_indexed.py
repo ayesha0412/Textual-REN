@@ -293,6 +293,7 @@ class IndexedQueryEngine:
         self.presence_model = PresenceModel(_pw)
 
         self._exemplar_reid = None  # lazy (Contribution A)
+        self._vlm_verifier  = None  # lazy (Intervention E — VLM-as-evidence)
         self._plan_override = None  # refined plan for current query (Contribution B)
 
         self.index_dir = index_dir
@@ -390,6 +391,31 @@ class IndexedQueryEngine:
         _timing = {}
         self._plan_override = None  # fresh per query
 
+        # ---- VLM verifier lazy init (Intervention E) ----
+        # Loaded once per process when use_vlm_verifier=true in config.
+        # Verifier itself is lazy: maybe_verify only fires when m_conf is
+        # thin, so the model can be loaded without paying inference cost
+        # on clean queries. Initialization failures (model not supported by
+        # the installed transformers version, model not on HF, VRAM too low)
+        # disable the verifier and continue without it — pipeline survives.
+        if (self._vlm_verifier is None and
+                self.config['text_query'].get('use_vlm_verifier', False)):
+            try:
+                from vlm_verifier import VLMVerifier
+                _vlm_model = self.config['text_query'].get(
+                    'vlm_model', 'Qwen/Qwen2.5-VL-3B-Instruct')
+                self._vlm_verifier = VLMVerifier(model_id=_vlm_model,
+                                                  device=str(self.device))
+                # Don't actually load yet — first verify() call triggers it.
+                # That way model download happens on first thin-margin case,
+                # not on every query.
+                print(f"  [VLM verifier] registered (model: {_vlm_model}); "
+                      f"will load on first thin-margin case")
+            except Exception as _e:
+                print(f"  [VLM verifier] init failed: {type(_e).__name__}: "
+                      f"{_e}  -- continuing without VLM")
+                self._vlm_verifier = None
+
         # ---- Stage 1: encode text query ----
         print(f"\nQuery: '{text_query}'")
         text_feat = self.localizer.encode_text(text_query)
@@ -421,13 +447,22 @@ class IndexedQueryEngine:
         all_sims = clip_sims
 
         # ---- Stage 2d: adaptive threshold ----
+        # Floor and ceiling are encoder-specific. CLIP's similarity range
+        # sits around 0.10-0.35 for valid matches; SigLIP's same-match
+        # similarities are systematically lower (around 0.04-0.20), so the
+        # CLIP-default [0.10, 0.30] clamp truncated SigLIP's adaptive τ
+        # above where its real signal lives → caused the "no frames above
+        # threshold 0.1" RuntimeError on q003/q008. Read both from config.
         use_adaptive = self.config.get('text_query', {}).get('adaptive_threshold', False)
         if use_adaptive:
-            alpha = self.config.get('text_query', {}).get('threshold_alpha', 1.0)
-            adaptive_tau = self._adaptive_threshold(all_sims, alpha=alpha)
+            alpha   = self.config.get('text_query', {}).get('threshold_alpha', 1.0)
+            min_tau = self.config.get('text_query', {}).get('adaptive_min_tau', 0.10)
+            max_tau = self.config.get('text_query', {}).get('adaptive_max_tau', 0.30)
+            adaptive_tau = self._adaptive_threshold(all_sims, alpha=alpha,
+                                                     min_tau=min_tau, max_tau=max_tau)
             print(f"  Adaptive threshold: tau={adaptive_tau:.4f} (alpha={alpha}, "
                   f"mean={all_sims.mean():.4f}, std={all_sims.std():.4f}, "
-                  f"fixed was {threshold})")
+                  f"clamp=[{min_tau}, {max_tau}], fixed was {threshold})")
             threshold = adaptive_tau
 
         n_above = int((all_sims >= threshold).sum())
@@ -436,10 +471,67 @@ class IndexedQueryEngine:
               f"above {threshold}: {n_above}/{len(all_sims)}")
 
         if n_above == 0:
-            print(f"  [Hint] Try --threshold {max(0.05, float(all_sims.max()) - 0.02):.2f}")
-            raise RuntimeError(
-                f"No frames found above similarity threshold {threshold}"
-            )
+            # Calibrated abstention path: no frame in the entire video clears
+            # the retrieval threshold. This is a legitimate "not found" result
+            # — NOT an error. Earlier the pipeline raised RuntimeError here,
+            # which (a) crashed the subprocess so the runner recorded ERROR
+            # instead of an abstention, and (b) corrupted the precision/recall
+            # ratios because the queries that SHOULD have been "not_found"
+            # were instead counted as crashes. We now write a proper minimal
+            # result.json and return cleanly.
+            print(f"  No frames above similarity threshold {threshold} "
+                  f"(max sim was {float(all_sims.max()):.4f}) -- "
+                  f"recording as 'not_found' (calibrated abstention).")
+            if json_out is not None:
+                _abstain = {
+                    'query': text_query,
+                    'video_path': video_path,
+                    'last_frame_idx': None,
+                    'last_frame_timestamp': None,
+                    'pred_bbox': None,
+                    'num_instances': 0,
+                    'instances': [],
+                    'tracked_frames_per_instance': [],
+                    'reid_occurrences': [],
+                    'confused': False,
+                    'confidence': 0.0,
+                    'presence': 0.0,
+                    'found': False,
+                    'decision': 'not_found',
+                    'evidence': {
+                        's_clip': float(all_sims.max()),
+                        's_patch': 0.0, 'm_conf': 0.0, 'q_blur': 0.0,
+                        'c_app': 0.0, 's_gdino': 0.0, 's_ret': 0.0,
+                        'a_frac': 0.0, 's_reid': 0.0,
+                    },
+                    'refine_history': [], 'refine_iters': 0,
+                    'clip_similarity': float(all_sims.max()),
+                    'fused_similarity': float(all_sims.max()),
+                    'region_point': None, 'region_clip_score': 0.0,
+                    'blur_quality': 0.0, 'consensus_iou': 0.0,
+                    'confusable_margin': 0.0,
+                    'similarity_threshold': threshold,
+                    'valid_segments': 0, 'frames_above_threshold': 0,
+                    'context_seconds': self.config.get('text_query', {})
+                                        .get('context_seconds', 6.0),
+                    'fps': fps,
+                    'timing': {'retrieve_s': round(time.time() - _t_start, 2)},
+                    'abstain_reason': 'no_frames_above_threshold',
+                }
+                os.makedirs(os.path.dirname(os.path.abspath(json_out)) or '.',
+                             exist_ok=True)
+                with open(json_out, 'w', encoding='utf-8') as _f:
+                    json.dump(_abstain, _f, indent=2, default=str)
+                # Also write a minimal result.json in output_dir for parity.
+                if output_dir:
+                    os.makedirs(output_dir, exist_ok=True)
+                    with open(os.path.join(output_dir, 'result.json'), 'w',
+                              encoding='utf-8') as _f:
+                        json.dump(_abstain, _f, indent=2, default=str)
+                return _abstain
+            # Even without json_out, return a minimal dict — callers expect one.
+            return {'decision': 'not_found', 'presence': 0.0, 'found': False,
+                    'abstain_reason': 'no_frames_above_threshold'}
 
         # ---- Stage 3: Selection Policy (temporal segmentation) ----
         selection_policy = SelectionPolicy(self.config)
@@ -486,16 +578,8 @@ class IndexedQueryEngine:
             conf_margin_delta = self.config.get('text_query', {}).get(
                 'confusable_margin_delta', 0.03)
             if conf_names:
-                import open_clip
-                tokens = open_clip.tokenize(conf_names).to(self.device)
-                with torch.no_grad():
-                    conf_feats = self.localizer.clip_model.encode_text(tokens).float()
-                conf_feats = F.normalize(conf_feats, dim=-1)
-                tgt_tokens = open_clip.tokenize([query_plan.target]).to(self.device)
-                with torch.no_grad():
-                    target_conf_feat = self.localizer.clip_model.encode_text(
-                        tgt_tokens).float()
-                target_conf_feat = F.normalize(target_conf_feat, dim=-1)
+                conf_feats       = self.localizer.encode_text_batch(conf_names)
+                target_conf_feat = self.localizer.encode_text_batch([query_plan.target])
             else:
                 conf_feats = None
                 target_conf_feat = None
@@ -533,13 +617,16 @@ class IndexedQueryEngine:
                     except Exception:
                         continue
 
+                    _use_sahi = self.config.get('text_query', {}).get('use_sahi', False)
+                    _vlm_top_k = self.config.get('text_query', {}).get('vlm_top_k', 3)
                     boxes = self.grounding_dino.best_boxes(
                         probe, det_query,
                         box_threshold=box_thresh, text_threshold=text_thresh,
                         clip_model=self.localizer.clip_model,
                         clip_preprocess=self.localizer.clip_preprocess,
                         text_feat=text_feat,
-                        top_k=1,
+                        top_k=max(1, _vlm_top_k),
+                        use_sahi=_use_sahi,
                     )
                     if not boxes:
                         blur_tag = f" BLURRY({frame_blur:.0f})" if is_blurry else ""
@@ -578,6 +665,43 @@ class IndexedQueryEngine:
                         meta_idx, bbox, text_np, probe.shape
                     ) if meta_idx is not None else clip_score
 
+                    # ---- VLM verification (Intervention E, v2) ----
+                    # Multi-crop: verify up to top-K crops (not just top-1).
+                    # If top-1 is wrong but top-3 has the target, VLM rescues
+                    # the query. Uses open-ended prompt + logit confidence +
+                    # attribute hints. Gate: fires when m_conf < vlm_min_margin.
+                    s_vlm, vlm_diag = 0.0, {"skipped": True}
+                    if self._vlm_verifier is not None:
+                        try:
+                            from vlm_verifier import maybe_verify_multi
+                            _vlm_min_margin = self.config['text_query'].get(
+                                'vlm_min_margin_for_skip', 0.05)
+                            _vlm_crops = []
+                            for _bi, (_bbox_i, _cs, _gs, _lb) in enumerate(boxes):
+                                _bx, _by, _bw, _bh = _bbox_i
+                                _vc = probe[_by:_by+_bh, _bx:_bx+_bw]
+                                if _vc.size > 0:
+                                    _vlm_crops.append(Image.fromarray(_vc))
+                            if _vlm_crops:
+                                s_vlm, vlm_diag = maybe_verify_multi(
+                                    self._vlm_verifier, _vlm_crops,
+                                    query_plan.target, m_conf=conf_margin,
+                                    min_margin_for_skip=_vlm_min_margin)
+                                if not vlm_diag.get("skipped"):
+                                    _nc = vlm_diag.get('n_crops_checked', 1)
+                                    _av = vlm_diag.get('all_verdicts', [])
+                                    print(f"      [VLM] {vlm_diag.get('verdict')}"
+                                          f" conf={vlm_diag.get('confidence',0):.2f}"
+                                          f" s_vlm={s_vlm:+.2f}"
+                                          f" checked={_nc}/{len(_vlm_crops)}"
+                                          f" verdicts={_av}"
+                                          f" ({vlm_diag.get('latency_s',0):.1f}s)")
+                        except Exception as _e:
+                            print(f"      [VLM] failed gracefully: "
+                                  f"{type(_e).__name__}: {_e}")
+                            s_vlm, vlm_diag = 0.0, {"skipped": True,
+                                                     "error": str(_e)}
+
                     # ---- Blur penalty ----
                     # Normalize blur to [0, 1]: 0=very blurry, 1=sharp
                     blur_norm = min(1.0, frame_blur / 500.0)
@@ -607,6 +731,7 @@ class IndexedQueryEngine:
                         'bbox': bbox, 'frame_idx': fidx,
                         'gdino': gdino_score, 'crop_feat': crop_feat,
                         'conf_name': conf_name,
+                        's_vlm': s_vlm, 'vlm_diag': vlm_diag,
                     })
 
             # First pass: check top-N candidates
@@ -703,6 +828,7 @@ class IndexedQueryEngine:
                 _t_ref = time.time()
                 _tau_ab = self.config['text_query'].get('tau_abstain', 0.2)
                 _tau_ac = self.config['text_query'].get('tau_accept', 0.5)
+                _tau_ref = self.config['text_query'].get('tau_refine', _tau_ac)
 
                 def _prelim_presence(b):
                     return self.presence_model.presence(EvidenceVector(
@@ -715,11 +841,23 @@ class IndexedQueryEngine:
                     ))
 
                 _p = _prelim_presence(best_evidence)
+                _m = float(best_evidence['conf_margin'])
                 refine_history.append(round(_p, 4))
                 _cur_plan = query_plan
                 _it = 0
-                while _it < _max_ref and _tau_ab <= _p < _tau_ac:
+                # Thin-margin escape hatch: refinement also fires when the
+                # preliminary presence cleared tau_accept BUT the confusable
+                # margin is thinner than min_clean_margin. Without this,
+                # high-p / negative-m_conf seeds (thermos→kettle, kettle→jug
+                # on q006) skip refinement and propagate through re-ID.
+                _min_margin = self.config['text_query'].get(
+                    'min_clean_margin', 0.02)
+                def _needs_refine(p, m):
+                    return (_tau_ab <= p < _tau_ref) or (p >= _tau_ref and m < _min_margin)
+                while _it < _max_ref and _needs_refine(_p, _m):
                     _it += 1
+                    _zone = ('uncertainty zone' if _p < _tau_ref
+                             else f'thin-margin (m_conf={_m:+.3f} < {_min_margin})')
                     feedback = {
                         'presence': round(_p, 4),
                         'issue': ('target barely outscored a look-alike'
@@ -731,8 +869,8 @@ class IndexedQueryEngine:
                             _cur_plan.detection_prompt.split('. '),
                         'frame_blur': round(float(best_evidence['blur_norm']), 3),
                     }
-                    print(f"\n  [Refine {_it}/{_max_ref}] presence {_p:.3f} in "
-                          f"uncertainty zone -- asking LLM to revise the plan...")
+                    print(f"\n  [Refine {_it}/{_max_ref}] presence {_p:.3f} "
+                          f"in {_zone} -- asking LLM to revise the plan...")
                     refined = self.query_parser.refine_plan(_cur_plan, feedback)
                     if refined is None:
                         print("  [Refine] LLM revision unavailable; stopping")
@@ -745,17 +883,8 @@ class IndexedQueryEngine:
                     conf_names = self._augmented_negatives(
                         refined.confusables, refined.target, text_query)
                     if conf_names:
-                        import open_clip
-                        _tk = open_clip.tokenize(conf_names).to(self.device)
-                        with torch.no_grad():
-                            conf_feats = F.normalize(
-                                self.localizer.clip_model.encode_text(_tk).float(),
-                                dim=-1)
-                        _tt = open_clip.tokenize([refined.target]).to(self.device)
-                        with torch.no_grad():
-                            target_conf_feat = F.normalize(
-                                self.localizer.clip_model.encode_text(_tt).float(),
-                                dim=-1)
+                        conf_feats       = self.localizer.encode_text_batch(conf_names)
+                        target_conf_feat = self.localizer.encode_text_batch([refined.target])
 
                     # Re-verify recent passing frames under the revised plan
                     _recheck = sorted(passed, key=lambda s: -s['frame_idx'])[:6] \
@@ -820,10 +949,44 @@ class IndexedQueryEngine:
                         print(f"  [Refine] response moved to frame "
                               f"{_nb['frame_idx']}")
                     _p = _prelim_presence(_nb)
+                    _m = float(best_evidence['conf_margin'])  # refresh for next loop check
                     refine_history.append(round(_p, 4))
                     print(f"  [Refine] presence {refine_history[-2]:.3f} -> "
-                          f"{_p:.3f}")
+                          f"{_p:.3f}  (m_conf={_m:+.3f})")
                 _timing['refine_s'] = round(time.time() - _t_ref, 2)
+
+                # VLM re-fire: refinement may have replaced best_evidence
+                # with a candidate whose VLM was skipped in the initial pass.
+                # Re-run VLM on the final best candidate if needed.
+                if (self._vlm_verifier is not None
+                        and best_evidence is not None
+                        and float(best_evidence.get('s_vlm', 0.0)) == 0.0
+                        and float(best_evidence.get('conf_margin', 1.0))
+                        < self.config['text_query'].get(
+                            'vlm_min_margin_for_skip', 0.05)):
+                    try:
+                        from vlm_verifier import maybe_verify
+                        _be = best_evidence
+                        _bx, _by, _bw, _bh = _be['bbox']
+                        _fidx = _be['frame_idx']
+                        _frame = self._load_single_frame(video_path, _fidx)
+                        _crop = _frame[_by:_by+_bh, _bx:_bx+_bw]
+                        if _crop.size > 0:
+                            _crop_pil = Image.fromarray(_crop)
+                            _svlm, _vdiag = maybe_verify(
+                                self._vlm_verifier, _crop_pil,
+                                query_plan.target,
+                                m_conf=float(_be['conf_margin']),
+                                min_margin_for_skip=self.config['text_query'].get(
+                                    'vlm_min_margin_for_skip', 0.05))
+                            best_evidence['s_vlm'] = _svlm
+                            best_evidence['vlm_diag'] = _vdiag
+                            if not _vdiag.get('skipped'):
+                                print(f"  [VLM post-refine] {_vdiag.get('verdict')}"
+                                      f" conf={_vdiag.get('confidence',0):.2f}"
+                                      f" s_vlm={_svlm:+.2f}")
+                    except Exception as _e:
+                        print(f"  [VLM post-refine] failed: {_e}")
 
         # ---- Confidence score ----
         # Calibrated confidence combining all signals
@@ -944,17 +1107,8 @@ class IndexedQueryEngine:
                 _margin = self.config.get('text_query', {}).get(
                     'confusable_margin_delta', 0.03)
                 if _conf_names:
-                    import open_clip
-                    _tokens = open_clip.tokenize(_conf_names).to(self.device)
-                    with torch.no_grad():
-                        _conf_feats = self.localizer.clip_model.encode_text(
-                            _tokens).float()
-                    _conf_feats = F.normalize(_conf_feats, dim=-1)
-                    _tt = open_clip.tokenize([_plan.target]).to(self.device)
-                    with torch.no_grad():
-                        _tgt_feat = self.localizer.clip_model.encode_text(
-                            _tt).float()
-                    _tgt_feat = F.normalize(_tgt_feat, dim=-1)
+                    _conf_feats = self.localizer.encode_text_batch(_conf_names)
+                    _tgt_feat   = self.localizer.encode_text_batch([_plan.target])
 
                 # Secondary instances need a minimum score floor too — the
                 # primary went through full verification, these did not
@@ -1011,6 +1165,7 @@ class IndexedQueryEngine:
             s_ret=_s_ret,
             a_frac=float(bw * bh) / _frame_area,
             s_reid=0.0,  # populated by exemplar re-ID (Contribution A, 1.5)
+            s_vlm=float(best_evidence.get('s_vlm', 0.0)) if best_evidence else 0.0,
         )
         presence = self.presence_model.presence(evidence)
         tau_abstain = self.config['text_query'].get('tau_abstain', 0.2)
@@ -1140,7 +1295,27 @@ class IndexedQueryEngine:
         # for other occurrences of the same object instance.
         reid_occurrences = []
         _reid_on = self.config['text_query'].get('exemplar_reid', True)
-        if _reid_on and presence >= tau_abstain:
+        _reid_min_margin = self.config['text_query'].get('min_clean_margin', 0.02)
+        _best_s_vlm = float(evidence.s_vlm)
+        # AND-gate: re-ID only on clean seeds. Three conditions:
+        #   1. presence >= tau_abstain (not abstaining)
+        #   2. confusable_margin >= min_clean_margin (margin not thin)
+        #   3. VLM didn't say NO (s_vlm >= 0) — a VLM-rejected detection
+        #      is the wrong object; propagating its fingerprint via re-ID
+        #      amplifies the error (observed: colander→"frying pan" on q002)
+        _reid_seed_ok = (presence >= tau_abstain) and \
+                        (confusable_margin >= _reid_min_margin) and \
+                        (_best_s_vlm >= 0.0)
+        if _reid_on and not _reid_seed_ok:
+            _reasons = []
+            if presence < tau_abstain:
+                _reasons.append(f"presence={presence:.3f} < {tau_abstain}")
+            if confusable_margin < _reid_min_margin:
+                _reasons.append(f"m_conf={confusable_margin:+.4f} < {_reid_min_margin}")
+            if _best_s_vlm < 0.0:
+                _reasons.append(f"VLM said NO (s_vlm={_best_s_vlm:+.3f})")
+            print(f"\n  [re-ID gate] skipped: {'; '.join(_reasons)}")
+        if _reid_on and _reid_seed_ok:
             _t_reid = time.time()
             try:
                 from exemplar_reid import ExemplarReID
