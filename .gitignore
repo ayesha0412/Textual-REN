@@ -30,9 +30,19 @@ _tmp_eval/
 eval/evaluation_results/**/*.mp4
 eval/evaluation_results/**/*.jpg
 eval/evaluation_results/**/debug_*
+eval/egomask_preds/*/_work/
+eval/EgoMask/dataset/
 
-# KEEP checkpoints - needed for inference
-# checkpoints/
+# Large model checkpoints
+checkpoints/*.pt
+checkpoints/*.pth
+
+# Claude Code internals
+.claude/worktrees/
+
+# Allow eval summary files (exceptions to *.json / *.csv rules)
+!eval/egomask_preds/*/summary_long.csv
+!eval/egomask_preds/*/long/default_exp_results.json
 
 # C extensions
 *.so
