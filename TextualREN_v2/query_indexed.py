@@ -1415,6 +1415,43 @@ class IndexedQueryEngine:
                 print(f"  [ReID] sweep failed: {e}")
             _timing['reid_s'] = round(time.time() - _t_reid, 2)
 
+        # ---- SAM2 tracking for re-ID occurrences ----
+        # Each re-ID hit is just a frame + bbox. Run SAM2 on each to produce
+        # a tracked mask sequence (same as primary detection gets).
+        reid_tracks = []
+        if reid_occurrences and not _skip_sam2 and _save_masks:
+            _t_reid_track = time.time()
+            _reid_ctx = self.config['text_query'].get(
+                'reid_context_seconds', context_seconds)
+            _reid_half = int(_reid_ctx * fps / 2)
+            print(f"  [ReID-SAM2] tracking {len(reid_occurrences)} "
+                  f"occurrence(s) with ±{_reid_ctx/2:.0f}s window")
+            for _oi, occ in enumerate(reid_occurrences):
+                _occ_fidx = occ['frame_idx']
+                try:
+                    _occ_frames, _occ_fi = self._load_frame_window(
+                        video_path, _occ_fidx, _reid_half)
+                    _occ_center = (_occ_fi.index(_occ_fidx)
+                                  if _occ_fidx in _occ_fi else 0)
+                    _occ_tr = self.localizer.track_from_bboxes(
+                        _occ_frames, _occ_center, [occ['bbox']],
+                        half_span=len(_occ_frames) // 2,
+                        return_masks=True,
+                    )
+                    for _tr in _occ_tr:
+                        for t in _tr:
+                            li = t['frame_idx']
+                            if li < len(_occ_fi):
+                                t['frame_idx'] = _occ_fi[li]
+                    reid_tracks.append(_occ_tr[0])
+                    print(f"  [ReID-SAM2] occ {_oi}: tracked "
+                          f"{len(_occ_tr[0])} frames around t={_occ_fidx/fps:.1f}s")
+                except Exception as e:
+                    print(f"  [ReID-SAM2] occ {_oi} tracking failed: {e}")
+                    reid_tracks.append([{'frame_idx': _occ_fidx,
+                                         'bbox': occ['bbox']}])
+            _timing['reid_track_s'] = round(time.time() - _t_reid_track, 2)
+
         _timing['track_s'] = round(time.time() - _t_mark, 2)
 
         if decision == 'not_found':
@@ -1515,9 +1552,9 @@ class IndexedQueryEngine:
                         'source': 'reid',
                         'seed_bbox': occ['bbox'],
                         'score': occ['s_reid'],
-                        'num_frames': 1,
-                        'frames': [{'frame_idx': occ['frame_idx'],
-                                    'bbox': occ['bbox']}],
+                        'num_frames': len(reid_tracks[i]) if i < len(reid_tracks) else 1,
+                        'frames': reid_tracks[i] if i < len(reid_tracks) else [
+                            {'frame_idx': occ['frame_idx'], 'bbox': occ['bbox']}],
                     }
                     for i, occ in enumerate(reid_occurrences)
                 ],
@@ -2009,6 +2046,21 @@ def main():
                         help='Write full machine-readable result (plan, evidence, '
                              'per-instance tracks with COCO RLE masks, timing) to '
                              'this path — benchmark adapters consume this file')
+    parser.add_argument('--context-seconds', type=float, default=None,
+                        dest='context_seconds',
+                        help='Override config context_seconds (SAM2 tracking window)')
+    parser.add_argument('--reid-context-seconds', type=float, default=None,
+                        dest='reid_context_seconds',
+                        help='SAM2 tracking window for re-ID occurrences '
+                             '(default: same as context_seconds)')
+    parser.add_argument('--max-reid', type=int, default=None, dest='max_reid',
+                        help='Override config max_reid_occurrences')
+    parser.add_argument('--exemplar-top-k', type=int, default=None,
+                        dest='exemplar_top_k',
+                        help='Override config exemplar_top_k (re-ID candidate rows)')
+    parser.add_argument('--skip-tracking', action='store_true',
+                        dest='skip_tracking',
+                        help='Skip SAM2 tracking (detection bbox only)')
 
     args = parser.parse_args()
 
@@ -2019,6 +2071,21 @@ def main():
         )
     with open(config_path, 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
+
+    if args.context_seconds is not None:
+        config['text_query']['context_seconds'] = args.context_seconds
+    if args.reid_context_seconds is not None:
+        config['text_query']['reid_context_seconds'] = args.reid_context_seconds
+    if args.skip_tracking:
+        config['text_query']['skip_sam2_eval'] = True
+        config['text_query']['exemplar_reid'] = False
+        config['text_query']['context_seconds'] = 2.0
+    if args.max_reid is not None:
+        config['text_query']['max_reid_occurrences'] = args.max_reid
+        if args.max_reid == 0:
+            config['text_query']['exemplar_reid'] = False
+    if args.exemplar_top_k is not None:
+        config['text_query']['exemplar_top_k'] = args.exemplar_top_k
 
     output_dir = (
         args.output or
