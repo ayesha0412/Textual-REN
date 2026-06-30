@@ -1,0 +1,101 @@
+decision,exp,expr,n_frames,n_hits,obj,presence,video,wall_s
+found,0,small blue cylindrical container near the floor,300,89,1,0.4367,0bfda958-2a25-4198-8de6-9348b4f483fb,470.6
+uncertain,1,"the small blue cylindrical container located on the floor near the corner of the room, surrounded by cables and tools, with a smooth surface and vibrant blue color",300,76,1,0.3656,0bfda958-2a25-4198-8de6-9348b4f483fb,396.3
+found,2,the black phone on the workbench near the fan,300,201,2,0.6503,0bfda958-2a25-4198-8de6-9348b4f483fb,305.5
+uncertain,3,"the black rectangular phone with a glossy surface, located on the cluttered workbench to the left of the person, near the blue cup and fan, and connected to a charging cable",300,114,2,0.3564,0bfda958-2a25-4198-8de6-9348b4f483fb,459.2
+found,0,white dishwashing brush on the drying rack,480,298,1,0.5799,5c1c8a7f-41f2-403d-8b1d-ae86ca8834b3,468.7
+found,1,"the white plastic dishwashing brush with a round bristle head, located on the drying rack near the sink, and then hanged against the wall",480,297,1,0.6644,5c1c8a7f-41f2-403d-8b1d-ae86ca8834b3,424.1
+found,2,yellow soap bottle with 'mama' text on the label,480,361,2,0.5205,5c1c8a7f-41f2-403d-8b1d-ae86ca8834b3,273.5
+found,3,"the yellow plastic soap bottle with a rounded shape, located near the sink faucet, has the word 'mama' prominently displayed on its label and remains stationary throughout the video",480,334,2,0.8097,5c1c8a7f-41f2-403d-8b1d-ae86ca8834b3,163.3
+found,0,transparent bottle near the stove,300,186,1,0.5129,6fa085e0-b124-4cd9-9a4e-b40901f943bb,458.1
+found,1,"the transparent bottle with a red cap, located near the stove and adjacent to the stack of pots, is used during the cooking process",300,210,1,0.6536,6fa085e0-b124-4cd9-9a4e-b40901f943bb,256.4
+found,2,"the light gray, handle-shaped chopping board near the sink, placed against the wall",300,241,2,0.7963,6fa085e0-b124-4cd9-9a4e-b40901f943bb,220.6
+found,3,"the light gray chopping board with a handle-like extension, located on the right side of the sink, consistently stationary throughout the video and positioned near various kitchen utensils and containers",300,241,2,0.7539,6fa085e0-b124-4cd9-9a4e-b40901f943bb,178.1
+found,4,the straw hat hanging on the wall,300,77,3,0.6182,6fa085e0-b124-4cd9-9a4e-b40901f943bb,228.8
+found,5,"the circular straw hat with a black band, hanging on the wall near the oven mitt and above the control panel",300,148,3,0.6355,6fa085e0-b124-4cd9-9a4e-b40901f943bb,484.6
+uncertain,0,white-handled cleaning brush with white bristles near the sink area,960,520,1,0.3,26f6ea45-4e7d-4208-b36c-715064151980,529.2
+found,1,"the white-handled cleaning brush with white bristles, located near the sink area, positioned to the right of the utensils and other cleaning tools, and hanging or placed in proximity to the wall",960,322,1,0.4972,26f6ea45-4e7d-4208-b36c-715064151980,476.7
+found,0,the snap-on stool with a red cushion,300,140,1,0.7358,64d2c99b-da75-4e86-a564-787ea0250c4b,322.1
+found,1,"the compact snap-on workshop stool with a red cushion, black frame, and wheels, located near tools and machinery in the workspace",300,26,1,0.5273,64d2c99b-da75-4e86-a564-787ea0250c4b,358.5
+found,2,the white and blue cylindrical paint can,300,76,2,0.6379,64d2c99b-da75-4e86-a564-787ea0250c4b,202.8
+found,3,"the medium-sized white and blue paint can with an orange stripe, located on the cluttered workbench near the duct tape and tools",300,35,2,0.8501,64d2c99b-da75-4e86-a564-787ea0250c4b,211.4
+found,4,the red-handled pliers near the engine,300,139,3,0.5654,64d2c99b-da75-4e86-a564-787ea0250c4b,265.7
+found,5,"the red-handled pliers located next to the engine's fuel tank, used during the repair process, with a distinct metallic grip and positioned among other tools on the equipment",300,240,3,0.5272,64d2c99b-da75-4e86-a564-787ea0250c4b,292.2
+uncertain,6,the green drill gun on the workbench,300,112,4,0.3634,64d2c99b-da75-4e86-a564-787ea0250c4b,411.0
+found,7,"the small, green-colored drill gun located on the cluttered workbench near the yellow machinery, surrounded by tools and fabric",300,52,4,0.4882,64d2c99b-da75-4e86-a564-787ea0250c4b,251.8
+found,0,"the yellow-bordered magazine titled ""the vikings.""",300,64,1,0.7946,302c0d84-004f-4b06-bd57-2703665161f8,305.9
+found,1,"the national geographic magazine with a yellow border and the title ""the vikings: lords of sea and sword,"" located on the glass coffee table near the silver vase and game controller",300,203,1,0.6131,302c0d84-004f-4b06-bd57-2703665161f8,273.3
+found,2,"the tall, silver, geometric-patterned vessel on the glass table",300,125,2,0.8941,302c0d84-004f-4b06-bd57-2703665161f8,220.1
+found,3,"the reflective, silver vessel with a geometric, faceted texture, located on the glass coffee table near the small plant and books, in front of the tv stand",300,132,2,0.827,302c0d84-004f-4b06-bd57-2703665161f8,261.4
+found,4,the black television on the white shelf,300,204,3,0.6546,302c0d84-004f-4b06-bd57-2703665161f8,306.1
+found,5,"the black rectangular television located on the top level of the white shelf, positioned in front of a large window with a view of trees, and placed near a small potted plant and electronic devices",300,209,3,0.7752,302c0d84-004f-4b06-bd57-2703665161f8,297.4
+found,0,the black-handled scissors on the workbench,480,175,1,0.8349,307c3ec6-886e-4d25-9ef7-7bea3cf7a243,410.6
+found,1,"the black-handled scissors located on the right side of the workbench, near the white tissue and orange-handled tools, occasionally being held and used by a person wearing black gloves",480,241,1,0.6208,307c3ec6-886e-4d25-9ef7-7bea3cf7a243,372.6
+found,2,the orange-handled soldering iron on the workbench,480,255,2,0.5378,307c3ec6-886e-4d25-9ef7-7bea3cf7a243,439.5
+found,3,"the orange-handled soldering iron with a metallic tip, located on the workbench near other tools like pliers, screwdrivers, and a spool of solder wire",480,72,2,0.6554,307c3ec6-886e-4d25-9ef7-7bea3cf7a243,279.6
+found,4,black handheld blowtorch on the workbench,480,274,3,0.5007,307c3ec6-886e-4d25-9ef7-7bea3cf7a243,424.7
+found,5,"the black handheld blowtorch with a compact cylindrical body and a nozzle, located on the metallic workbench surrounded by various tools like screwdrivers and wrenches",480,350,3,0.5381,307c3ec6-886e-4d25-9ef7-7bea3cf7a243,460.5
+found,6,the small black circular tape on the workspace,480,44,4,0.5624,307c3ec6-886e-4d25-9ef7-7bea3cf7a243,527.7
+found,7,"the compact black roll of tape located on the metal workspace, surrounded by tools like screwdrivers and pliers, occasionally handled by a person wearing black gloves",480,97,4,0.5202,307c3ec6-886e-4d25-9ef7-7bea3cf7a243,221.3
+found,0,the small white plate with red food pieces,480,198,1,0.5447,412ee977-da12-496e-9609-80bfef2f4638,587.6
+found,1,"the small, round, white plate located on the countertop near the sink, containing red food pieces, positioned next to the bowl with floral patterns and surrounded by vegetables",480,271,1,0.5346,412ee977-da12-496e-9609-80bfef2f4638,283.1
+uncertain,2,the white ceramic cup near the kitchen sink,480,193,2,0.305,412ee977-da12-496e-9609-80bfef2f4638,347.0
+uncertain,3,"the white ceramic cup with a handle, located near the kitchen sink, positioned close to the faucet and surrounded by other kitchen items like dishes and bowls",480,283,2,0.3474,412ee977-da12-496e-9609-80bfef2f4638,371.5
+found,4,the tall white bottle with a red cap,480,325,3,0.7951,412ee977-da12-496e-9609-80bfef2f4638,398.5
+found,5,"the tall, cylindrical white bottle with a red cap, located on the kitchen counter near the sink and surrounded by dishes and other kitchen items",480,325,3,0.7292,412ee977-da12-496e-9609-80bfef2f4638,414.0
+found,6,white microwave oven below wooden cabinets,480,390,4,0.4377,412ee977-da12-496e-9609-80bfef2f4638,411.6
+found,7,"the white microwave oven with a vented top, a perforated viewing window on the door, and a keypad on the right side, located below the wooden cabinets and above the stove",480,289,4,0.8411,412ee977-da12-496e-9609-80bfef2f4638,320.0
+found,8,the tall black pot on the stove's right burner,480,253,5,0.8405,412ee977-da12-496e-9609-80bfef2f4638,273.9
+found,9,"the tall, cylindrical black cooking pot with two side handles, positioned on the right burner of the stove beneath the microwave, remaining stationary throughout the video",480,255,5,0.8543,412ee977-da12-496e-9609-80bfef2f4638,237.9
+found,0,the bright yellow chair near the glass wall,300,14,1,0.717,563db64f-47c4-42e3-b8bf-c543fd78655a,386.9
+found,1,"the vibrant yellow chair with a smooth surface, positioned close to the glass wall and adjacent to the hallway, standing out due to its distinct color and curved design",300,10,1,0.7273,563db64f-47c4-42e3-b8bf-c543fd78655a,281.2
+found,2,"the small black chair near the desk, with its back to the door",300,8,2,0.503,563db64f-47c4-42e3-b8bf-c543fd78655a,253.6
+found,3,"the compact black chair positioned close to the desk, with its back to the door and located in the office space near the cart and other office supplies",300,16,2,0.5289,563db64f-47c4-42e3-b8bf-c543fd78655a,337.1
+found,4,the white photocopier near the black shelf,300,18,3,0.4605,563db64f-47c4-42e3-b8bf-c543fd78655a,275.0
+found,5,"the white and black photocopier machine located next to the tall black shelf, with a flat top and a control panel on its upper surface, positioned in the corner of the office space",300,12,3,0.4074,563db64f-47c4-42e3-b8bf-c543fd78655a,362.7
+found,6,the blue and white dustbin under the desk,300,11,4,0.4344,563db64f-47c4-42e3-b8bf-c543fd78655a,301.8
+found,7,"the blue and white dustbin located beneath the desk, positioned near stacks of papers and folders, with a dual-compartment design for waste separation",300,15,4,0.4526,563db64f-47c4-42e3-b8bf-c543fd78655a,356.1
+found,8,the black and white stapler near the keyboard and papers,300,9,5,0.4175,563db64f-47c4-42e3-b8bf-c543fd78655a,273.0
+found,9,"the black and white stapler, located on the desk near the keyboard and papers",300,67,5,0.598,563db64f-47c4-42e3-b8bf-c543fd78655a,263.3
+found,0,the wooden cutting board on the right shelf,300,130,1,0.5907,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,308.9
+found,1,"the rectangular wooden cutting board placed vertically on the right-hand shelf, next to the stacked bowls and above the countertop",300,100,1,0.5357,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,376.4
+found,2,white pan with decorative patterns and a white handle,300,220,2,0.6212,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,371.6
+found,3,"the small white pan with decorative patterns, a white handle, and a lid, located near the sink and stove",300,200,2,0.8287,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,288.3
+found,4,the red container with strawberry patterns,300,178,3,0.8441,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,304.9
+found,5,"the medium-sized, round, red container with a lid, decorated with strawberry illustrations, located near the sink and surrounded by jars and kitchen items",300,183,3,0.8226,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,210.2
+found,6,the plastic container with a yellow and brown label near the refrigerator sticker,300,84,4,0.6779,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,337.4
+found,7,"the transparent plastic container with a yellow and brown label, located on a refrigerator, positioned near the golden refrigerator sticker and surrounded by small colorful objects",300,153,4,0.5622,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,366.7
+uncertain,8,"the white teacup with text on its side, hung on a wooden shelf",300,70,5,0.3492,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,498.7
+uncertain,9,"the white ceramic teacup with a curved handle, featuring text on its side, , hung on a wooden shelf near the colorful bowls and other kitchenware",300,69,5,0.3948,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,333.6
+found,10,the metallic cylindrical teapot located on the bottom left side of the shelf,300,204,6,0.5502,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,340.7
+found,11,"the black-colored, shiny metallic teapot with a cylindrical shape, located on the bottom left side of the shelf, next to the green and purple hanging fabric and below the plates and bowls",300,187,6,0.4051,4033a78e-6e89-4abd-90a8-d4446f4bbc1b,480.4
+found,0,the pile of green-striped watermelons near the produce section,300,92,1,0.6048,c51b9716-6871-4c13-ba8f-64afbd8f8cc1,301.9
+found,1,"the group of oval-shaped, green watermelons with light green stripes, located near the produce section, displayed in a metal bin with a yellow price tag",300,79,1,0.5462,c51b9716-6871-4c13-ba8f-64afbd8f8cc1,267.1
+found,2,the pile of white garlic surrounded by cucumbers and other vegetables,300,86,2,0.575,c51b9716-6871-4c13-ba8f-64afbd8f8cc1,227.2
+found,3,"the cluster of white, bulb-shaped garlic located in the produce section, positioned next to the cucumbers and near the onions, with a smooth texture and slightly larger size compared to the onions",300,78,2,0.6202,c51b9716-6871-4c13-ba8f-64afbd8f8cc1,144.3
+found,0,"the tall transparent plastic bottle with a white cap, contains a brown liquid",262,158,1,0.6607,cf858e06-feec-4fa9-8c73-10cc28f95ef6,260.7
+found,1,"the tall, cylindrical transparent plastic bottle with a white cap, located near the stove and other cooking utensils, positioned upright and containing a brown liquid",262,187,1,0.6662,cf858e06-feec-4fa9-8c73-10cc28f95ef6,212.0
+found,2,the black pot on the stove,262,159,2,0.5021,cf858e06-feec-4fa9-8c73-10cc28f95ef6,340.0
+found,3,"the black cooking pot located on the stove, with a  spoon resting inside it, positioned next to a bottle of cooking oil and used for cooking vegetables",262,158,2,0.5421,cf858e06-feec-4fa9-8c73-10cc28f95ef6,260.8
+found,4,the white rectangular chopping board near the sink,262,166,3,0.6927,cf858e06-feec-4fa9-8c73-10cc28f95ef6,233.7
+found,5,"the flat, white, rectangular chopping board located to the right of the sink, positioned vertically on the countertop, near  kitchen utensils",262,140,3,0.6259,cf858e06-feec-4fa9-8c73-10cc28f95ef6,212.7
+found,0,the round metal platter with small dough balls,480,441,1,0.8541,f7d0c10d-af27-4bca-b61e-7a5d67c7ac4f,184.2
+found,1,"the circular silver-colored metal platter containing evenly arranged small, oval-shaped dough balls, placed on a table near a red container labeled ""deepak"" and surrounded by other kitchen items",480,443,1,0.7738,f7d0c10d-af27-4bca-b61e-7a5d67c7ac4f,164.4
+uncertain,2,the transparent plastic bottle with a blue cap,480,422,2,0.3833,f7d0c10d-af27-4bca-b61e-7a5d67c7ac4f,230.2
+found,3,"the transparent plastic bottle with a blue cap, located on the right side of the table, standing upright near other containers and bottles, and appearing consistently in the same position throughout the video",480,422,2,0.5893,f7d0c10d-af27-4bca-b61e-7a5d67c7ac4f,367.9
+uncertain,4,the rectangular wooden box near the bottles,480,125,3,0.1986,f7d0c10d-af27-4bca-b61e-7a5d67c7ac4f,235.2
+found,5,"the small rectangular box made of wood, located on the right side of the workspace, near the bottles and behind the metal plates",480,155,3,0.7402,f7d0c10d-af27-4bca-b61e-7a5d67c7ac4f,314.3
+uncertain,0,the white mug hanging on a wall-mounted rack,300,56,1,0.3515,fbbc8a46-c80e-419a-887e-8301fb7c1c36,536.6
+found,1,"the small white hanging on a wall-mounted rack, stationary throughout the video, with a smooth surface and a typical cylindrical shape",300,121,1,0.5043,fbbc8a46-c80e-419a-887e-8301fb7c1c36,335.8
+uncertain,0,the light blue cup near the table's edge,300,7,1,0.2889,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,405.3
+found,1,"the small light blue cup with a handle, located near the edge of the white table, positioned close to the glass of yellow liquid and surrounded by various items like tissue rolls and utensils",300,41,1,0.6961,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,257.3
+found,2,"the green plastic sieve on the countertop, near the wooden chopping board",300,20,2,0.5871,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,245.9
+found,3,"the green, circular plastic sieve located near the edge of the kitchen countertop, near the sink, the wooden chopping board and other kitchen utensils",300,16,2,0.5204,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,254.7
+found,4,the vertical wooden chopping board near the green sieve,300,16,3,0.691,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,306.1
+found,5,"the light brown, rectangular wooden chopping board standing upright on the countertop, positioned to the right of the sink and next to a green sieve",300,16,3,0.8284,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,260.2
+found,6,"the blue pen on the white table, in front of the mobile phone",300,31,4,0.5719,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,341.4
+found,7,"the blue pen located on the white table, in front of the mobile phone, near a water bottle, appearing stationary throughout the video",300,21,4,0.6585,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,287.6
+uncertain,8,"the transparent plastic water bottle on the table, with a blue label",300,65,5,0.3835,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,326.0
+found,9,"the transparent blue plastic water bottle with a white cap, located on the right side of the table near a blue pen, remaining stationary throughout the video",300,34,5,0.5988,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,379.8
+uncertain,10,the metallic electric kettle on the kitchen counter,300,33,6,0.3386,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,274.1
+found,11,"the shiny, stainless steel electric kettle with a black handle, located on the kitchen counter near the stove",300,46,6,0.4782,92207d1e-5cc6-41b5-bbd1-ed679aa997bd,318.1

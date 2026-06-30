@@ -1,0 +1,15 @@
+{
+    "J": 66.09,
+    "F": 67.62,
+    "J&F": 66.85,
+    "T_f1": 52.95,
+    "T_acc": 76.61,
+    "T_precision": 50.58,
+    "T_recall": 68.16,
+    "iou_overall": 66.09,
+    "iou_gold": 30.45,
+    "iou_gold_with_pred": 23.58,
+    "detection_flag": 76.0,
+    "detection_bbox_iou": 34.23,
+    "detection_mask_iou": 37.06
+}
